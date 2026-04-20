@@ -31,6 +31,18 @@ HF_MODELS=(
   |$MODELS_DIR/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
   |$MODELS_DIR/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+  # FLUX.1 dev fp8 (best open-source T2I)
+  "https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-dev-fp8-e4m3fn.safetensors
+  |$MODELS_DIR/diffusion_models/flux1-dev-fp8.safetensors"
+  "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
+  |$MODELS_DIR/text_encoders/clip_l.safetensors"
+  "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors
+  |$MODELS_DIR/text_encoders/t5xxl_fp8_e4m3fn.safetensors"
+  "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors
+  |$MODELS_DIR/vae/ae.safetensors"
+  # Wan 2.2 Animate 14B (video-to-video / image-to-video animation, bf16 only)
+  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_animate_14B_bf16.safetensors
+  |$MODELS_DIR/diffusion_models/wan2.2_animate_14B_bf16.safetensors"
 )
 
 # Wget declarations: "URL|OUTPUT_PATH"
