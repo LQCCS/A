@@ -554,6 +554,19 @@ main() {
     mkdir -p "$INPUTS_DIR"
     mkdir -p "$MODELS_DIR"/{checkpoints,text_encoders,latent_upscale_models,loras,vae,diffusion_models}
 
+    # 安装 VideoHelperSuite（提供 VHS_LoadVideo，V2V 工作流必须）
+    local vhs_dir="${COMFYUI_DIR}/custom_nodes/ComfyUI-VideoHelperSuite"
+    if [ ! -d "$vhs_dir" ]; then
+        log "Installing ComfyUI-VideoHelperSuite..."
+        git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git "$vhs_dir"
+        if [ -f "$vhs_dir/requirements.txt" ]; then
+            pip install -q -r "$vhs_dir/requirements.txt" 2>&1 | tee -a "$MODEL_LOG"
+        fi
+        log "✓ VideoHelperSuite installed"
+    else
+        log "VideoHelperSuite already installed, skipping"
+    fi
+
     # 后台等待 pyworker 安装完毕后自动打补丁，不阻塞模型下载
     patch_ws_timeout &
 
