@@ -513,6 +513,33 @@ CLEAN_OUTPUT
     fi
 }
 
+patch_ws_timeout() {
+    # 等待 comfyui-api-wrapper 安装完毕后，将 WebSocket 空消息超时从 60s 改为 600s，
+    # 防止冷启动（模型加载）期间 GPU 满载导致 WebSocket 60s 无消息而误杀任务。
+    local target="/opt/comfyui-api-wrapper/workers/generation_worker.py"
+    local max_wait=300
+    local waited=0
+
+    while [[ ! -f "$target" ]]; do
+        if [[ $waited -ge $max_wait ]]; then
+            log "[WARN] patch_ws_timeout: $target 未在 ${max_wait}s 内出现，跳过补丁"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    if grep -q 'message_timeout = 60\.0' "$target"; then
+        sed -i 's/message_timeout = 60\.0/message_timeout = 600.0/' "$target"
+        log "✓ patch_ws_timeout: WebSocket message_timeout 已改为 600s"
+        # 重启 api-wrapper 使改动生效（uvicorn 以 daemon 模式运行）
+        pkill -f 'uvicorn.*main:app' 2>/dev/null || true
+        log "✓ patch_ws_timeout: api-wrapper 已重启"
+    else
+        log "patch_ws_timeout: 未匹配到 60.0（可能已修改或版本不同），跳过"
+    fi
+}
+
 main() {
     log "Starting ComfyUI provisioning..."
 
@@ -526,6 +553,9 @@ main() {
     mkdir -p "$WORKFLOWS_DIR"
     mkdir -p "$INPUTS_DIR"
     mkdir -p "$MODELS_DIR"/{checkpoints,text_encoders,latent_upscale_models,loras,vae,diffusion_models}
+
+    # 后台等待 pyworker 安装完毕后自动打补丁，不阻塞模型下载
+    patch_ws_timeout &
 
     write_api_workflow
     set_cleanup_job
