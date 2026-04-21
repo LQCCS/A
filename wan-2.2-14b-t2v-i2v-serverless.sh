@@ -1,6 +1,8 @@
 #!/bin/bash
 
-set -euo pipefail
+# 注意：故意不使用 set -e（errexit），避免任何单点失败中断整个 provisioning 流程。
+# 模型下载、补丁等每个函数自行处理错误，主流程始终跑完。
+set -uo pipefail
 
 ### Configuration ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
@@ -66,15 +68,7 @@ script_cleanup() {
     find "$INPUTS_DIR" -name "*.lock" -type f -mmin +60 -delete 2>/dev/null || true
 }
 
-script_error() {
-    local exit_code=$?
-    local line_number=$1
-    log "[ERROR] Provisioning Script failed at line $line_number with exit code $exit_code"
-    exit "$exit_code"
-}
-
 trap script_cleanup EXIT
-trap 'script_error $LINENO' ERR
 
 download_hf_file() {
     local url="$1"
@@ -719,11 +713,13 @@ update_comfyui() {
     fi
 
     log "update_comfyui: 更新 ComfyUI..."
-    cd "$comfyui_dir" || return 1
+    cd "$comfyui_dir" || { log "[WARN] update_comfyui: 无法进入 $comfyui_dir，跳过"; return 0; }
 
     local before_commit
     before_commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    git pull --ff-only 2>&1 | tee -a "$MODEL_LOG"
+    # 用 checkout -B 处理 detached HEAD 情况（git pull --ff-only 在 detached HEAD 上会报错）
+    git fetch origin master 2>&1 | tee -a "$MODEL_LOG" || true
+    git checkout -B master origin/master 2>&1 | tee -a "$MODEL_LOG" || true
     local after_commit
     after_commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
