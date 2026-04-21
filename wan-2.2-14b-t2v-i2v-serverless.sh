@@ -38,6 +38,7 @@ HF_MODELS=(
   |$MODELS_DIR/text_encoders/clip_l.safetensors"
   "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors
   |$MODELS_DIR/text_encoders/t5xxl_fp8_e4m3fn.safetensors"
+  # ae.safetensors (FLUX.1 VAE) — Gated Repo，403 时自动跳过不阻塞，T2I 需要时请先在 HF 接受协议
   "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors
   |$MODELS_DIR/vae/ae.safetensors"
   # Wan 2.2 Animate 14B (video-to-video / image-to-video animation, bf16 only)
@@ -117,20 +118,29 @@ download_hf_file() {
         while [ $attempt -le $max_retries ]; do
             log "Downloading $repo/$file_path (attempt $attempt/$max_retries)..."
 
-            if hf download "$repo" \
+            local dl_output
+            dl_output=$(hf download "$repo" \
                 "$file_path" \
                 --local-dir "$temp_dir" \
-                --cache-dir "$temp_dir/.cache" 2>&1 | tee -a "$MODEL_LOG"; then
+                --cache-dir "$temp_dir/.cache" 2>&1 | tee -a "$MODEL_LOG")
+            local dl_exit=${PIPESTATUS[0]}
 
-                if [ -f "$temp_dir/$file_path" ]; then
-                    mv "$temp_dir/$file_path" "$output_path"
-                    rm -rf "$temp_dir"
-                    release_slot "$slot"
-                    log "✓ Successfully downloaded: $output_path"
-                    exit 0
-                else
-                    log "✗ Download command succeeded but file not found at $temp_dir/$file_path"
-                fi
+            # 403 GatedRepoError — 永久性权限错误，立即跳过不重试
+            if echo "$dl_output" | grep -q "GatedRepoError\|403 Client Error\|Access to model.*is restricted"; then
+                log "⚠️  Skipping $output_path — Gated Repo (403), accept terms on HuggingFace to enable download"
+                rm -rf "$temp_dir"
+                release_slot "$slot"
+                exit 0
+            fi
+
+            if [ $dl_exit -eq 0 ] && [ -f "$temp_dir/$file_path" ]; then
+                mv "$temp_dir/$file_path" "$output_path"
+                rm -rf "$temp_dir"
+                release_slot "$slot"
+                log "✓ Successfully downloaded: $output_path"
+                exit 0
+            else
+                log "✗ Download command succeeded but file not found at $temp_dir/$file_path"
             fi
 
             log "✗ Download failed (attempt $attempt/$max_retries), retrying in ${current_delay}s..."
