@@ -550,6 +550,163 @@ patch_ws_timeout() {
     fi
 }
 
+patch_api_wrapper() {
+    # 在 api-wrapper main.py 中插入 /generate/async 别名路由，
+    # 使 ttv.py 的 POST /generate/async 请求能被正确路由到 /generate。
+    local target="/opt/comfyui-api-wrapper/main.py"
+    local max_wait=300
+    local waited=0
+
+    while [[ ! -f "$target" ]]; do
+        if [[ $waited -ge $max_wait ]]; then
+            log "[WARN] patch_api_wrapper: $target 未在 ${max_wait}s 内出现，跳过"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    if grep -q '"/generate/async"' "$target"; then
+        log "patch_api_wrapper: /generate/async 已存在，跳过"
+        return 0
+    fi
+
+    python3 - << 'PYEOF'
+import sys
+path = "/opt/comfyui-api-wrapper/main.py"
+with open(path) as f:
+    content = f.read()
+marker = '@app.post("/generate",'
+if marker not in content:
+    print(f"ERROR: marker not found in {path}", file=sys.stderr)
+    sys.exit(1)
+alias = '@app.post("/generate/async", response_model=Result)\n'
+content = content.replace(marker, alias + marker, 1)
+with open(path, "w") as f:
+    f.write(content)
+print(f"✓ /generate/async alias added to {path}")
+PYEOF
+
+    local py_exit=$?
+    if [[ $py_exit -eq 0 ]]; then
+        log "✓ patch_api_wrapper: main.py 已打补丁"
+        pkill -f 'uvicorn.*main:app' 2>/dev/null || true
+        log "✓ patch_api_wrapper: api-wrapper 已重启"
+    else
+        log "[WARN] patch_api_wrapper: Python 补丁失败 (exit $py_exit)"
+    fi
+}
+
+patch_pyworker() {
+    # 在 pyworker worker.py 中注册 /generate/async 和 /generate handler，
+    # 并添加 GET /result/{id} 透传到 api-wrapper（port 18288），
+    # 使 ttv.py 的异步任务轮询能正确返回结果。
+    local target="/workspace/vast-pyworker/workers/comfyui-json/worker.py"
+    local max_wait=300
+    local waited=0
+
+    while [[ ! -f "$target" ]]; do
+        if [[ $waited -ge $max_wait ]]; then
+            log "[WARN] patch_pyworker: $target 未在 ${max_wait}s 内出现，跳过"
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    if grep -q '"/generate/async"' "$target"; then
+        log "patch_pyworker: /generate/async 已存在，跳过"
+        return 0
+    fi
+
+    python3 - << 'PYEOF'
+import sys
+path = "/workspace/vast-pyworker/workers/comfyui-json/worker.py"
+with open(path) as f:
+    content = f.read()
+
+# 1. 扩展 handlers 列表，加入 /generate/async 和 /generate
+old_handlers = '''    handlers=[
+        HandlerConfig(
+            route="/generate/sync",
+            allow_parallel_requests=False,
+            max_queue_time=10.0,
+            benchmark_config=BenchmarkConfig(
+                dataset=benchmark_dataset,
+            )
+        )
+    ],'''
+new_handlers = '''    handlers=[
+        HandlerConfig(
+            route="/generate/sync",
+            allow_parallel_requests=False,
+            max_queue_time=10.0,
+            benchmark_config=BenchmarkConfig(
+                dataset=benchmark_dataset,
+            )
+        ),
+        HandlerConfig(
+            route="/generate/async",
+            allow_parallel_requests=True,
+            max_queue_time=30.0,
+        ),
+        HandlerConfig(
+            route="/generate",
+            allow_parallel_requests=True,
+            max_queue_time=30.0,
+        ),
+    ],'''
+
+if old_handlers not in content:
+    print(f"ERROR: handlers block not found in {path}", file=sys.stderr)
+    sys.exit(1)
+content = content.replace(old_handlers, new_handlers, 1)
+
+# 2. 替换 Worker(worker_config).run()，注入 GET 透传路由
+old_run = "Worker(worker_config).run()"
+new_run = '''import aiohttp as _aiohttp
+from aiohttp import web as _web
+
+
+async def _get_passthrough(request):
+    url = f"http://127.0.0.1:18288{request.raw_path}"
+    try:
+        async with _aiohttp.ClientSession() as _sess:
+            async with _sess.get(url) as _resp:
+                _body = await _resp.read()
+                _ct = _resp.content_type or "application/json"
+                return _web.Response(body=_body, status=_resp.status, content_type=_ct)
+    except Exception as _e:
+        return _web.Response(text=str(_e), status=502)
+
+
+_worker = Worker(worker_config)
+_worker.routes.append(_web.get("/result/{request_id}", _get_passthrough))
+_worker.routes.append(_web.get("/health", _get_passthrough))
+_worker.routes.append(_web.get("/queue-info", _get_passthrough))
+_worker.run()'''
+
+if old_run not in content:
+    print(f"ERROR: Worker(worker_config).run() not found in {path}", file=sys.stderr)
+    sys.exit(1)
+content = content.replace(old_run, new_run, 1)
+
+with open(path, "w") as f:
+    f.write(content)
+print(f"✓ pyworker patched: /generate/async + GET passthrough added to {path}")
+PYEOF
+
+    local py_exit=$?
+    if [[ $py_exit -eq 0 ]]; then
+        log "✓ patch_pyworker: worker.py 已打补丁，重启 pyworker 使改动生效（下次启动自动跳过）..."
+        # 重启 pyworker：Vast.ai 检测到退出后会重新执行 start_server.sh，
+        # 此时 worker.py 已包含补丁，provisioning 的幂等检查会跳过，pyworker 以新代码运行。
+        pkill -f 'workers.comfyui-json.worker' 2>/dev/null || true
+    else
+        log "[WARN] patch_pyworker: Python 补丁失败 (exit $py_exit)"
+    fi
+}
+
 main() {
     log "Starting ComfyUI provisioning..."
 
@@ -577,8 +734,10 @@ main() {
         log "VideoHelperSuite already installed, skipping"
     fi
 
-    # 后台等待 pyworker 安装完毕后自动打补丁，不阻塞模型下载
+    # 后台等待各组件安装完毕后自动打补丁，不阻塞模型下载
     patch_ws_timeout &
+    patch_api_wrapper &
+    patch_pyworker &
 
     write_api_workflow
     set_cleanup_job
