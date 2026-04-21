@@ -698,10 +698,10 @@ PYEOF
 
     local py_exit=$?
     if [[ $py_exit -eq 0 ]]; then
-        log "✓ patch_pyworker: worker.py 已打补丁，重启 pyworker 使改动生效（下次启动自动跳过）..."
-        # 重启 pyworker：Vast.ai 检测到退出后会重新执行 start_server.sh，
-        # 此时 worker.py 已包含补丁，provisioning 的幂等检查会跳过，pyworker 以新代码运行。
-        pkill -f 'workers.comfyui-json.worker' 2>/dev/null || true
+        log "✓ patch_pyworker: worker.py 已打补丁（生效于 pyworker 下次重启时）"
+        # 注意：不在此处 pkill，因为 start_server.sh 重启时会重新 git clone pyworker 覆盖补丁。
+        # 补丁通过 /workspace/.pyworker_patched marker 做幂等保护，实际生效依赖 api-wrapper 降级。
+        touch /workspace/.pyworker_patched
     else
         log "[WARN] patch_pyworker: Python 补丁失败 (exit $py_exit)"
     fi
