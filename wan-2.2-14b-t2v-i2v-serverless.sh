@@ -707,6 +707,38 @@ PYEOF
     fi
 }
 
+update_comfyui() {
+    # 更新 ComfyUI 到最新合并提交以获得 WanVideoToVideo 等新节点支持。
+    # 当前 Docker 镜像内置版本为 0.7.0 (2025-12-30)，缺少 Wan 2.2 Animate 内置节点。
+    local comfyui_dir="/workspace/ComfyUI"
+    local marker="${comfyui_dir}/.comfyui_updated"
+
+    if [[ -f "$marker" ]]; then
+        log "update_comfyui: ComfyUI 已是最新版，跳过"
+        return 0
+    fi
+
+    log "update_comfyui: 更新 ComfyUI..."
+    cd "$comfyui_dir" || return 1
+
+    local before_commit
+    before_commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    git pull --ff-only 2>&1 | tee -a "$MODEL_LOG"
+    local after_commit
+    after_commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+    if [[ "$before_commit" == "$after_commit" ]]; then
+        log "update_comfyui: 已是最新提交 ($after_commit)，无需重启"
+        touch "$marker"
+        return 0
+    fi
+
+    log "update_comfyui: 已更新 $before_commit → $after_commit，重启 ComfyUI..."
+    supervisorctl restart comfyui 2>&1 | tee -a "$MODEL_LOG" || true
+    touch "$marker"
+    log "✓ update_comfyui: ComfyUI 已更新并重启"
+}
+
 main() {
     log "Starting ComfyUI provisioning..."
 
@@ -733,6 +765,9 @@ main() {
     else
         log "VideoHelperSuite already installed, skipping"
     fi
+
+    # 更新 ComfyUI 到最新版本（获取 WanVideoToVideo 等 Wan 2.2 标准节点）
+    update_comfyui
 
     # 后台等待各组件安装完毕后自动打补丁，不阻塞模型下载
     patch_ws_timeout &
@@ -776,11 +811,10 @@ main() {
     done
 
     if [ $failed -eq 1 ]; then
-        log "[ERROR] One or more downloads failed"
-        exit 1
+        log "[WARN] One or more downloads failed (non-fatal)"
     fi
 
-    log "✓ All downloads completed successfully"
+    log "✓ All downloads completed"
 }
 
 main
