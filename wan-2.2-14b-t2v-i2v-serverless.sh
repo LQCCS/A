@@ -561,9 +561,9 @@ patch_api_wrapper() {
         waited=$((waited + 5))
     done
 
-    # 用 _async_task_store 作为真正异步实现的 sentinel
-    if grep -q '_async_task_store' "$target"; then
-        log "patch_api_wrapper: 真正异步实现已存在，跳过"
+    # 用 PATCHED_NO_CANCEL_ON_DISCONNECT 作为全量补丁的 sentinel
+    if grep -q 'PATCHED_NO_CANCEL_ON_DISCONNECT' "$target"; then
+        log "patch_api_wrapper: 补丁已存在，跳过"
         return 0
     fi
 
@@ -641,6 +641,19 @@ async def _get_async_result(_result_rid: str):
 '''
 
 content = content.replace(marker, injection + marker, 1)
+
+# ── 修复 watch_disconnect 误取消任务 ──────────────────────────────────────────
+# vast.ai 代理 60s 断连时不应 cancel 任务，任务继续跑，S3 轮询会找到结果。
+old_cancel = '499 DISCONNECTED for {request_id}'
+new_cancel = 'client disconnected (task continues) for {request_id}'
+if old_cancel in content:
+    content = content.replace(old_cancel, new_cancel, 1)
+    # 同时去掉 _mark_request_cancelled 调用
+    old_mark = '\n                        await _mark_request_cancelled(request_id)'
+    if old_mark in content:
+        content = content.replace(old_mark, '\n                        # PATCHED_NO_CANCEL_ON_DISCONNECT', 1)
+    print("✓ watch_disconnect 取消逻辑已禁用")
+
 with open(path, "w") as f:
     f.write(content)
 print(f"✓ /generate/async 真正异步实现已注入 {path}")
