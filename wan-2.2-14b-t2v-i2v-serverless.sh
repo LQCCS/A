@@ -578,8 +578,13 @@ old_alias = '@app.post("/generate/async", response_model=Result)\n'
 if old_alias in content:
     content = content.replace(old_alias, '', 1)
 
-marker = '@app.post("/generate",'
-if marker not in content:
+marker = None
+for _q in ("'", '"'):
+    _candidate = f"@app.post({_q}/generate{_q},"
+    if _candidate in content:
+        marker = _candidate
+        break
+if marker is None:
     print(f"ERROR: marker not found in {path}", file=sys.stderr)
     sys.exit(1)
 
