@@ -545,8 +545,9 @@ patch_ws_timeout() {
 }
 
 patch_api_wrapper() {
-    # 在 api-wrapper main.py 中插入 /generate/async 别名路由，
-    # 使 ttv.py 的 POST /generate/async 请求能被正确路由到 /generate。
+    # 在 api-wrapper main.py 中实现真正的非阻塞 /generate/async：
+    # 立即返回 task_id，后台通过 localhost:18288 调用 /generate 完成推理。
+    # 绕过 vast.ai SSL 代理层的 60s 连接超时（499 DISCONNECTED 根因）。
     local target="/opt/comfyui-api-wrapper/main.py"
     local max_wait=300
     local waited=0
@@ -560,8 +561,9 @@ patch_api_wrapper() {
         waited=$((waited + 5))
     done
 
-    if grep -q '"/generate/async"' "$target"; then
-        log "patch_api_wrapper: /generate/async 已存在，跳过"
+    # 用 _async_task_store 作为真正异步实现的 sentinel
+    if grep -q '_async_task_store' "$target"; then
+        log "patch_api_wrapper: 真正异步实现已存在，跳过"
         return 0
     fi
 
@@ -570,20 +572,78 @@ import sys
 path = "/opt/comfyui-api-wrapper/main.py"
 with open(path) as f:
     content = f.read()
+
+# 移除旧的简单别名（如果存在）
+old_alias = '@app.post("/generate/async", response_model=Result)\n'
+if old_alias in content:
+    content = content.replace(old_alias, '', 1)
+
 marker = '@app.post("/generate",'
 if marker not in content:
     print(f"ERROR: marker not found in {path}", file=sys.stderr)
     sys.exit(1)
-alias = '@app.post("/generate/async", response_model=Result)\n'
-content = content.replace(marker, alias + marker, 1)
+
+injection = '''
+# ── /generate/async 真正异步实现 ─────────────────────────────────────────────
+# 立即返回 task_id，后台经 localhost 调用 /generate，绕开 vast.ai 代理 60s 限制。
+import asyncio as _asyncio_p
+import json as _json_p
+import time as _time_p
+_async_task_store: dict = {}
+
+
+@app.post("/generate/async")
+async def _generate_async_patched(request: Request):
+    body = await request.body()
+    try:
+        _d = _json_p.loads(body)
+        _rid = (
+            ((_d.get("payload") or {}).get("input") or {}).get("request_id")
+            or f"async_{int(_time_p.time() * 1000)}"
+        )
+    except Exception:
+        _rid = f"async_{int(_time_p.time() * 1000)}"
+    _async_task_store[_rid] = {"status": "pending"}
+
+    async def _bg():
+        try:
+            import aiohttp as _ah
+            async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=None)) as _s:
+                # 直接调用 api-wrapper 内部端口，不经过 vast.ai 代理，无 60s 限制
+                async with _s.post(
+                    "http://127.0.0.1:18288/generate",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                ) as _r:
+                    _async_task_store[_rid] = await _r.json()
+        except Exception as _e:
+            _async_task_store[_rid] = {"status": "failed", "message": str(_e)}
+
+    _asyncio_p.create_task(_bg())
+    return {"id": _rid, "status": "pending"}
+
+
+@app.get("/result/{_result_rid}")
+async def _get_async_result(_result_rid: str):
+    _r = _async_task_store.get(_result_rid)
+    if _r is None:
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"status": "not_found"}, status_code=404)
+    return _r
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+'''
+
+content = content.replace(marker, injection + marker, 1)
 with open(path, "w") as f:
     f.write(content)
-print(f"✓ /generate/async alias added to {path}")
+print(f"✓ /generate/async 真正异步实现已注入 {path}")
 PYEOF
 
     local py_exit=$?
     if [[ $py_exit -eq 0 ]]; then
-        log "✓ patch_api_wrapper: main.py 已打补丁"
+        log "✓ patch_api_wrapper: main.py 已打补丁（真正异步）"
         pkill -f 'uvicorn.*main:app' 2>/dev/null || true
         log "✓ patch_api_wrapper: api-wrapper 已重启"
     else
