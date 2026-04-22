@@ -648,11 +648,17 @@ old_cancel = '499 DISCONNECTED for {request_id}'
 new_cancel = 'client disconnected (task continues) for {request_id}'
 if old_cancel in content:
     content = content.replace(old_cancel, new_cancel, 1)
-    # 同时去掉 _mark_request_cancelled 调用
+    # 同时去掉 _mark_request_cancelled 调用（若存在）
     old_mark = '\n                        await _mark_request_cancelled(request_id)'
     if old_mark in content:
-        content = content.replace(old_mark, '\n                        # PATCHED_NO_CANCEL_ON_DISCONNECT', 1)
+        content = content.replace(old_mark, '\n                        pass  # PATCHED_NO_CANCEL_ON_DISCONNECT', 1)
+    else:
+        # 函数调用不存在（新镜像），在文件末尾追加 sentinel 注释保证幂等
+        content += '\n# PATCHED_NO_CANCEL_ON_DISCONNECT\n'
     print("✓ watch_disconnect 取消逻辑已禁用")
+else:
+    # 旧日志关键字不存在（已是新版或已打过）
+    content += '\n# PATCHED_NO_CANCEL_ON_DISCONNECT\n'
 
 with open(path, "w") as f:
     f.write(content)
@@ -662,7 +668,7 @@ PYEOF
     local py_exit=$?
     if [[ $py_exit -eq 0 ]]; then
         log "✓ patch_api_wrapper: main.py 已打补丁（真正异步）"
-        pkill -f 'uvicorn.*main:app' 2>/dev/null || true
+        supervisorctl restart api-wrapper 2>/dev/null || pkill -f 'uvicorn.*main:app' 2>/dev/null || true
         log "✓ patch_api_wrapper: api-wrapper 已重启"
     else
         log "[WARN] patch_api_wrapper: Python 补丁失败 (exit $py_exit)"
