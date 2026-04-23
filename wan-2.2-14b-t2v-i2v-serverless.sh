@@ -113,15 +113,20 @@ download_hf_file() {
             log "Downloading $repo/$file_path (attempt $attempt/$max_retries)..."
 
             local dl_output
+            local hf_token_arg=""
+            if [ -n "${HF_TOKEN:-}" ]; then
+                hf_token_arg="--token $HF_TOKEN"
+            fi
             dl_output=$(hf download "$repo" \
                 "$file_path" \
                 --local-dir "$temp_dir" \
-                --cache-dir "$temp_dir/.cache" 2>&1 | tee -a "$MODEL_LOG")
+                --cache-dir "$temp_dir/.cache" \
+                $hf_token_arg 2>&1 | tee -a "$MODEL_LOG")
             local dl_exit=${PIPESTATUS[0]}
 
             # 403 GatedRepoError — 永久性权限错误，立即跳过不重试
             if echo "$dl_output" | grep -q "GatedRepoError\|403 Client Error\|Access to model.*is restricted"; then
-                log "⚠️  Skipping $output_path — Gated Repo (403), accept terms on HuggingFace to enable download"
+                log "⚠️  Skipping $output_path — Gated Repo (403), set HF_TOKEN env var and accept terms on HuggingFace to enable download"
                 rm -rf "$temp_dir"
                 release_slot "$slot"
                 exit 0
@@ -561,8 +566,8 @@ patch_api_wrapper() {
         waited=$((waited + 5))
     done
 
-    # 用 PATCHED_NO_CANCEL_ON_DISCONNECT 作为全量补丁的 sentinel
-    if grep -q 'PATCHED_NO_CANCEL_ON_DISCONNECT' "$target"; then
+    # 用 PATCHED_WORKER_BUSY_BLOCKING_V1 作为全量补丁的 sentinel
+    if grep -q 'PATCHED_WORKER_BUSY_BLOCKING_V1' "$target"; then
         log "patch_api_wrapper: 补丁已存在，跳过"
         return 0
     fi
@@ -589,16 +594,26 @@ if marker is None:
     sys.exit(1)
 
 injection = '''
-# ── /generate/async 真正异步实现 ─────────────────────────────────────────────
-# 立即返回 task_id，后台经 localhost 调用 /generate，绕开 vast.ai 代理 60s 限制。
-import asyncio as _asyncio_p
+# ── /generate/async 阻塞版：保持 pyworker num_requests_working > 0 直到生成完成 ──
+# PATCHED_WORKER_BUSY_BLOCKING_V1
+#
+# 设计原理：
+#   调用内部 /generate/sync（localhost，无代理超时），handler 阻塞到生成完成。
+#   pyworker HandlerConfig 在 handler 返回前持续报告 num_requests_working > 0，
+#   vast.ai 路由层不会把新任务分配到本 worker，彻底防止 VRAM OOM。
+#   客户端（ttv.py）连接会在 60s 代理超时后断开，已有 S3 轮询兜底。
 import json as _json_p
 import time as _time_p
 _async_task_store: dict = {}
+_worker_busy: bool = False
 
 
 @app.post("/generate/async")
 async def _generate_async_patched(request: Request):
+    global _worker_busy
+    from fastapi.responses import JSONResponse as _JR
+    if _worker_busy:
+        return _JR({"status": "busy", "message": "worker is processing another task"}, status_code=503)
     body = await request.body()
     try:
         _d = _json_p.loads(body)
@@ -609,22 +624,21 @@ async def _generate_async_patched(request: Request):
     except Exception:
         _rid = f"async_{int(_time_p.time() * 1000)}"
     _async_task_store[_rid] = {"status": "pending"}
-
-    async def _bg():
-        try:
-            import aiohttp as _ah
-            async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=None)) as _s:
-                # 直接调用 api-wrapper 内部端口，不经过 vast.ai 代理，无 60s 限制
-                async with _s.post(
-                    "http://127.0.0.1:18288/generate",
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                ) as _r:
-                    _async_task_store[_rid] = await _r.json()
-        except Exception as _e:
-            _async_task_store[_rid] = {"status": "failed", "message": str(_e)}
-
-    _asyncio_p.create_task(_bg())
+    _worker_busy = True
+    try:
+        import aiohttp as _ah
+        # /generate/sync 是 localhost 内部调用，无 60s 代理超时，阻塞到生成完成
+        async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=None)) as _s:
+            async with _s.post(
+                "http://127.0.0.1:18288/generate/sync",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            ) as _r:
+                _async_task_store[_rid] = await _r.json()
+    except Exception as _e:
+        _async_task_store[_rid] = {"status": "failed", "message": str(_e)}
+    finally:
+        _worker_busy = False
     return {"id": _rid, "status": "pending"}
 
 
@@ -651,18 +665,17 @@ if old_cancel in content:
     # 同时去掉 _mark_request_cancelled 调用（若存在）
     old_mark = '\n                        await _mark_request_cancelled(request_id)'
     if old_mark in content:
-        content = content.replace(old_mark, '\n                        pass  # PATCHED_NO_CANCEL_ON_DISCONNECT', 1)
+        content = content.replace(old_mark, '\n                        pass  # PATCHED_WORKER_BUSY_BLOCKING_V1', 1)
     else:
-        # 函数调用不存在（新镜像），在文件末尾追加 sentinel 注释保证幂等
-        content += '\n# PATCHED_NO_CANCEL_ON_DISCONNECT\n'
+        content += '\n# PATCHED_WORKER_BUSY_BLOCKING_V1\n'
     print("✓ watch_disconnect 取消逻辑已禁用")
 else:
     # 旧日志关键字不存在（已是新版或已打过）
-    content += '\n# PATCHED_NO_CANCEL_ON_DISCONNECT\n'
+    content += '\n# PATCHED_WORKER_BUSY_BLOCKING_V1\n'
 
 with open(path, "w") as f:
     f.write(content)
-print(f"✓ /generate/async 真正异步实现已注入 {path}")
+print(f"✓ /generate/async 阻塞版已注入 {path}")
 PYEOF
 
     local py_exit=$?
@@ -725,12 +738,12 @@ new_handlers = '''    handlers=[
         ),
         HandlerConfig(
             route="/generate/async",
-            allow_parallel_requests=True,
+            allow_parallel_requests=False,
             max_queue_time=30.0,
         ),
         HandlerConfig(
             route="/generate",
-            allow_parallel_requests=True,
+            allow_parallel_requests=False,
             max_queue_time=30.0,
         ),
     ],'''
