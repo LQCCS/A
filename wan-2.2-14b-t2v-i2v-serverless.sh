@@ -33,9 +33,18 @@ HF_MODELS=(
   |$MODELS_DIR/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors
   |$MODELS_DIR/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
-  # FLUX.1 dev fp8 (best open-source T2I)
+  # FLUX.1 dev bf16 全精度（~24GB，Gated Repo，需在 HF 接受协议后才能下载；403 时自动跳过不阻塞）
+  "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors
+  |$MODELS_DIR/diffusion_models/flux1-dev.safetensors"
+  # FLUX.1 dev fp8 fallback（~12GB，无需 HF 协议，bf16 下载失败时备用）
   "https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-dev-fp8-e4m3fn.safetensors
   |$MODELS_DIR/diffusion_models/flux1-dev-fp8.safetensors"
+  # FLUX.1 Kontext dev fp8 (reference-based editing / multi-ref style transfer)
+  "https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-kontext-dev-fp8-e4m3fn.safetensors
+  |$MODELS_DIR/diffusion_models/flux1-kontext-dev-fp8.safetensors"
+  # XLabs Realism LoRA for FLUX（压制卡通/动漫风，增强写实摄影质感，适合美妆/产品场景）
+  "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors
+  |$MODELS_DIR/loras/flux-realism-lora.safetensors"
   "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
   |$MODELS_DIR/text_encoders/clip_l.safetensors"
   "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors
@@ -566,10 +575,13 @@ patch_api_wrapper() {
         waited=$((waited + 5))
     done
 
-    # 用 PATCHED_WORKER_BUSY_BLOCKING_V1 作为全量补丁的 sentinel
-    if grep -q 'PATCHED_WORKER_BUSY_BLOCKING_V1' "$target"; then
-        log "patch_api_wrapper: 补丁已存在，跳过"
+    # V2 sentinel：心跳流版，防止代理 60s idle-timeout 断连导致 pyworker 误报 idle
+    if grep -q 'PATCHED_WORKER_HEARTBEAT_V2' "$target"; then
+        log "patch_api_wrapper: 补丁已是最新 V2（心跳流），跳过"
         return 0
+    fi
+    if grep -q 'PATCHED_WORKER_BUSY_BLOCKING_V1' "$target"; then
+        log "patch_api_wrapper: 发现 V1 阻塞补丁，升级到 V2（心跳流）"
     fi
 
     python3 - << 'PYEOF'
@@ -583,6 +595,7 @@ old_alias = '@app.post("/generate/async", response_model=Result)\n'
 if old_alias in content:
     content = content.replace(old_alias, '', 1)
 
+# 查找注入标记（原始 /generate 路由）
 marker = None
 for _q in ("'", '"'):
     _candidate = f"@app.post({_q}/generate{_q},"
@@ -593,17 +606,35 @@ if marker is None:
     print(f"ERROR: marker not found in {path}", file=sys.stderr)
     sys.exit(1)
 
+# 移除旧 V1 注入块（如果存在），避免重复
+V1_START = '# ── /generate/async 阻塞版'
+if V1_START in content:
+    idx_end = content.find(marker)
+    if idx_end > 0:
+        idx_start = content.rfind(V1_START, 0, idx_end)
+        if idx_start >= 0:
+            content = content[:idx_start] + content[idx_end:]
+            print("✓ V1 injection removed (upgrading to V2)")
+
 injection = '''
-# ── /generate/async 阻塞版：保持 pyworker num_requests_working > 0 直到生成完成 ──
-# PATCHED_WORKER_BUSY_BLOCKING_V1
+# ── /generate/async 心跳流版：防止代理 60s idle-timeout 误断，保持 pyworker busy ──
+# PATCHED_WORKER_HEARTBEAT_V2
 #
-# 设计原理：
-#   调用内部 /generate/sync（localhost，无代理超时），handler 阻塞到生成完成。
-#   pyworker HandlerConfig 在 handler 返回前持续报告 num_requests_working > 0，
-#   vast.ai 路由层不会把新任务分配到本 worker，彻底防止 VRAM OOM。
-#   客户端（ttv.py）连接会在 60s 代理超时后断开，已有 S3 轮询兜底。
+# 根本原因：/generate/async 阻塞执行期间 5-10 分钟无数据传输，
+#   vast.ai SSL 代理 60s idle-timeout 主动断连 → pyworker 收到连接中断
+#   → num_requests_working = 0 → vast.ai 认为 worker 空闲 → 关闭实例。
+#
+# 修复方案：
+#   1. 生成在独立 asyncio.Task (_bg_run) 中运行，与 HTTP handler 生命周期解耦。
+#      即使代理断连 / asyncio cancel，生成任务不受影响，继续跑到完成。
+#   2. HTTP handler 返回 StreamingResponse，每 30s yield 一个 \n 心跳字节，
+#      持续向代理发送数据，防止 60s 无数据触发 idle-timeout 断连。
+#      pyworker 持续等待响应结束 → num_requests_working > 0 全程保持。
+#   3. 生成完毕后，流发送最终 JSON 并关闭。pyworker 收到完整响应后
+#      num_requests_working → 0，vast.ai 开始正常 idle 计时。
 import json as _json_p
 import time as _time_p
+import asyncio as _asyncio_p
 _async_task_store: dict = {}
 _worker_busy: bool = False
 
@@ -611,7 +642,7 @@ _worker_busy: bool = False
 @app.post("/generate/async")
 async def _generate_async_patched(request: Request):
     global _worker_busy
-    from fastapi.responses import JSONResponse as _JR
+    from fastapi.responses import JSONResponse as _JR, StreamingResponse as _SR
     if _worker_busy:
         return _JR({"status": "busy", "message": "worker is processing another task"}, status_code=503)
     body = await request.body()
@@ -625,21 +656,44 @@ async def _generate_async_patched(request: Request):
         _rid = f"async_{int(_time_p.time() * 1000)}"
     _async_task_store[_rid] = {"status": "pending"}
     _worker_busy = True
-    try:
-        import aiohttp as _ah
-        # /generate/sync 是 localhost 内部调用，无 60s 代理超时，阻塞到生成完成
-        async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=None)) as _s:
-            async with _s.post(
-                "http://127.0.0.1:18288/generate/sync",
-                data=body,
-                headers={"Content-Type": "application/json"},
-            ) as _r:
-                _async_task_store[_rid] = await _r.json()
-    except Exception as _e:
-        _async_task_store[_rid] = {"status": "failed", "message": str(_e)}
-    finally:
-        _worker_busy = False
-    return {"id": _rid, "status": "pending"}
+    _done_evt = _asyncio_p.Event()
+
+    async def _bg_run():
+        global _worker_busy
+        try:
+            import aiohttp as _ah
+            async with _ah.ClientSession(timeout=_ah.ClientTimeout(total=None)) as _s:
+                async with _s.post(
+                    "http://127.0.0.1:18288/generate/sync",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                ) as _r:
+                    _async_task_store[_rid] = await _r.json()
+        except Exception as _e:
+            _async_task_store[_rid] = {"status": "failed", "message": str(_e)}
+        finally:
+            _worker_busy = False
+            _done_evt.set()
+
+    _asyncio_p.ensure_future(_bg_run())  # 独立任务，不受 handler cancel 影响
+
+    async def _heartbeat():
+        # 每 30s 发 \n 心跳，防止代理 60s 无数据断连；完成后发最终 JSON
+        try:
+            while not _done_evt.is_set():
+                yield b"\\n"
+                try:
+                    await _asyncio_p.wait_for(
+                        _asyncio_p.shield(_done_evt.wait()), timeout=30.0
+                    )
+                    break
+                except _asyncio_p.TimeoutError:
+                    continue
+            yield _json_p.dumps({"id": _rid, "status": "pending"}).encode()
+        except _asyncio_p.CancelledError:
+            pass  # 代理关闭连接；_bg_run 不受影响，继续运行到完成
+
+    return _SR(_heartbeat(), media_type="application/json")
 
 
 @app.get("/result/{_result_rid}")
@@ -657,25 +711,22 @@ async def _get_async_result(_result_rid: str):
 content = content.replace(marker, injection + marker, 1)
 
 # ── 修复 watch_disconnect 误取消任务 ──────────────────────────────────────────
-# vast.ai 代理 60s 断连时不应 cancel 任务，任务继续跑，S3 轮询会找到结果。
 old_cancel = '499 DISCONNECTED for {request_id}'
 new_cancel = 'client disconnected (task continues) for {request_id}'
 if old_cancel in content:
     content = content.replace(old_cancel, new_cancel, 1)
-    # 同时去掉 _mark_request_cancelled 调用（若存在）
     old_mark = '\n                        await _mark_request_cancelled(request_id)'
     if old_mark in content:
-        content = content.replace(old_mark, '\n                        pass  # PATCHED_WORKER_BUSY_BLOCKING_V1', 1)
+        content = content.replace(old_mark, '\n                        pass  # PATCHED_WORKER_HEARTBEAT_V2', 1)
     else:
-        content += '\n# PATCHED_WORKER_BUSY_BLOCKING_V1\n'
+        content += '\n# PATCHED_WORKER_HEARTBEAT_V2\n'
     print("✓ watch_disconnect 取消逻辑已禁用")
 else:
-    # 旧日志关键字不存在（已是新版或已打过）
-    content += '\n# PATCHED_WORKER_BUSY_BLOCKING_V1\n'
+    content += '\n# PATCHED_WORKER_HEARTBEAT_V2\n'
 
 with open(path, "w") as f:
     f.write(content)
-print(f"✓ /generate/async 阻塞版已注入 {path}")
+print(f"✓ /generate/async 心跳流 V2 已注入 {path}")
 PYEOF
 
     local py_exit=$?
