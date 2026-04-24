@@ -937,94 +937,28 @@ main() {
     write_api_workflow
     set_cleanup_job
 
-    # ── 模型下载策略 ──────────────────────────────────────────────────────────
-    # 优先同步下载 FLUX T2I 所需全部模型（benchmark + 上线即可接 T2I 任务）：
-    #   • wan_2.1_vae.safetensors  ~388MB  （benchmark 用）
-    #   • clip_l.safetensors       ~246MB  （FLUX text encoder L）
-    #   • t5xxl_fp8_e4m3fn         ~9.5GB  （FLUX text encoder T5）
-    #   • ae.safetensors           ~600MB  （FLUX VAE，gated）
-    #   • flux1-dev.safetensors    ~24GB   （FLUX unet bf16，gated）
-    #   • flux-realism-lora        ~800MB  （写实 LoRA）
-    # 以上共 ~35GB，3 并行下载约 2-4 分钟，远在 provisioning timeout 内。
-    # WAN 14B 大模型（umt5_xxl、各 wan2.2 diffusion models ~60GB）写入 nohup 后台脚本。
-    #
-    # FLUX 模型里 flux1-dev 和 ae.safetensors 为 Gated Repo，
-    # download_hf_file 遇到 403 会自动跳过并打印 WARN，不会阻塞。
-
-    # 1. 定义需要前台同步的模型（FLUX T2I 全套 + VAE + LoRA）
-    local SYNC_MODELS=(
-        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors
-        |$MODELS_DIR/vae/wan_2.1_vae.safetensors"
-        "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
-        |$MODELS_DIR/text_encoders/clip_l.safetensors"
-        "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors
-        |$MODELS_DIR/text_encoders/t5xxl_fp8_e4m3fn.safetensors"
-        "https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors
-        |$MODELS_DIR/vae/ae.safetensors"
-        "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors
-        |$MODELS_DIR/diffusion_models/flux1-dev.safetensors"
-        "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors
-        |$MODELS_DIR/loras/flux-realism-lora.safetensors"
-    )
-
-    log "Downloading FLUX T2I models synchronously (~35GB, up to ${HF_MAX_PARALLEL} parallel)..."
-    local sync_pids=()
-    for _entry in "${SYNC_MODELS[@]}"; do
+    # ── 模型下载 ──────────────────────────────────────────────────────────────
+    # 有了 HF_TOKEN 后速度 200-500MB/s，全套 ~95GB 约 5-10 分钟，
+    # 全部同步下载完再退出，实例 benchmark 通过时所有模型均已就绪。
+    log "Downloading all models (~95GB total, up to ${HF_MAX_PARALLEL} parallel)..."
+    local all_pids=()
+    for model in "${HF_MODELS[@]}"; do
         local _url _out
-        _url="${_entry%%|*}"; _url=$(echo "$_url" | xargs)
-        _out="${_entry##*|}"; _out=$(echo "$_out" | xargs)
+        _url="${model%%|*}"; _url=$(echo "$_url" | xargs)
+        _out="${model##*|}"; _out=$(echo "$_out" | xargs)
         download_hf_file "$_url" "$_out" &
-        sync_pids+=($!)
+        all_pids+=($!)
     done
-    for _pid in "${sync_pids[@]}"; do wait "$_pid" || true; done
-    log "✓ FLUX T2I models sync download complete"
-
-    # 2. 生成后台下载脚本（WAN 14B + kontext fp8 等剩余大模型）
-    # 已同步下载的路径集合，用于跳过
-    local -A _sync_done=()
-    for _entry in "${SYNC_MODELS[@]}"; do
-        local _out="${_entry##*|}"; _out=$(echo "$_out" | xargs)
-        _sync_done["$_out"]=1
+    for item in "${WGET_DOWNLOADS[@]}"; do
+        [[ -z "${item// }" ]] && continue
+        local _url _out
+        _url="${item%%|*}"; _url=$(echo "$_url" | xargs)
+        _out="${item##*|}"; _out=$(echo "$_out" | xargs)
+        download_wget_file "$_url" "$_out" &
+        all_pids+=($!)
     done
-
-    local bg_log="${WORKSPACE_DIR}/bg_downloads.log"
-    local bg_script="${WORKSPACE_DIR}/bg_downloads.sh"
-    {
-        echo '#!/bin/bash'
-        echo "MODEL_LOG=$(printf '%q' "$bg_log")"
-        echo "HF_SEMAPHORE_DIR=$(printf '%q' "${WORKSPACE_DIR}/hf_bg_sem_$$")"
-        echo "HF_MAX_PARALLEL=${HF_MAX_PARALLEL}"
-        echo "export HF_TOKEN=$(printf '%q' "${HF_TOKEN:-}")"
-        echo "export HUGGING_FACE_HUB_TOKEN=$(printf '%q' "${HF_TOKEN:-}")"
-        echo 'mkdir -p "$HF_SEMAPHORE_DIR"'
-        echo 'trap '"'"'rm -rf "$HF_SEMAPHORE_DIR"'"'"' EXIT'
-        declare -f log acquire_slot release_slot download_hf_file download_wget_file
-        echo 'pids=()'
-        for model in "${HF_MODELS[@]}"; do
-            local _url _out
-            _url="${model%%|*}"; _url=$(echo "$_url" | xargs)
-            _out="${model##*|}"; _out=$(echo "$_out" | xargs)
-            [[ -n "${_sync_done[$_out]+x}" ]] && continue
-            echo "download_hf_file $(printf '%q' "$_url") $(printf '%q' "$_out") &"
-            echo 'pids+=($!)'
-        done
-        for item in "${WGET_DOWNLOADS[@]}"; do
-            [[ -z "${item// }" ]] && continue
-            local _url _out
-            _url="${item%%|*}"; _url=$(echo "$_url" | xargs)
-            _out="${item##*|}"; _out=$(echo "$_out" | xargs)
-            echo "download_wget_file $(printf '%q' "$_url") $(printf '%q' "$_out") &"
-            echo 'pids+=($!)'
-        done
-        echo 'for pid in "${pids[@]}"; do wait "$pid" || true; done'
-        echo "echo '[BG] All background downloads complete' | tee -a \"$bg_log\""
-    } > "$bg_script"
-    chmod +x "$bg_script"
-    log "Starting background downloads (WAN 14B models) → $bg_log"
-    nohup "$bg_script" >> "$bg_log" 2>&1 &
-    disown $!
-
-    log "✓ Provisioning complete. FLUX T2I ready immediately. WAN video models downloading in background (see $bg_log)"
+    for _pid in "${all_pids[@]}"; do wait "$_pid" || true; done
+    log "✓ All models downloaded. Provisioning complete."
 }
 
 main
