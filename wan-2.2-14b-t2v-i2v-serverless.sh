@@ -643,7 +643,7 @@ injection = '''
 # 修复方案：
 #   1. 生成在独立 asyncio.Task (_bg_run) 中运行，与 HTTP handler 生命周期解耦。
 #      即使代理断连 / asyncio cancel，生成任务不受影响，继续跑到完成。
-#   2. HTTP handler 返回 StreamingResponse，每 30s yield 一个 \n 心跳字节，
+#   2. HTTP handler 返回 StreamingResponse，每 30s yield 一个 \\n 心跳字节，
 #      持续向代理发送数据，防止 60s 无数据触发 idle-timeout 断连。
 #      pyworker 持续等待响应结束 → num_requests_working > 0 全程保持。
 #   3. 生成完毕后，流发送最终 JSON 并关闭。pyworker 收到完整响应后
@@ -694,7 +694,7 @@ async def _generate_async_patched(request: Request):
     _asyncio_p.ensure_future(_bg_run())  # 独立任务，不受 handler cancel 影响
 
     async def _heartbeat():
-        # 每 30s 发 \n 心跳，防止代理 60s 无数据断连；完成后发最终 JSON
+        # 每 30s 发 \\n 心跳，防止代理 60s 无数据断连；完成后发最终 JSON
         try:
             while not _done_evt.is_set():
                 yield b"\\n"
