@@ -487,12 +487,24 @@ WORKFLOW_JSON
 }
 EOF
 
+    # benchmark 只需 wan_2.1_vae.safetensors（~388MB），写轻量 VAE-only workflow，
+    # 避免需要 14B 大模型 → 下载超时 → 实例 Error 销毁的死循环。
+    local benchmark_workflow_json
+    read -r -d '' benchmark_workflow_json << 'BENCH_EOF' || true
+{
+  "1": {"inputs": {"width": 64, "height": 64, "batch_size": 1}, "class_type": "EmptyLatentImage", "_meta": {"title": "Empty Latent"}},
+  "2": {"inputs": {"vae_name": "wan_2.1_vae.safetensors"}, "class_type": "VAELoader", "_meta": {"title": "Load VAE"}},
+  "3": {"inputs": {"samples": ["1", 0], "vae": ["2", 0]}, "class_type": "VAEDecode", "_meta": {"title": "VAE Decode"}},
+  "4": {"inputs": {"images": ["3", 0], "filename_prefix": "benchmark"}, "class_type": "SaveImage", "_meta": {"title": "Save Image"}}
+}
+BENCH_EOF
+
     local benchmark_dir="$WORKSPACE/vast-pyworker/workers/comfyui-json/misc"
     while [[ ! -d "$benchmark_dir" ]]; do
         sleep 1
     done
 
-    echo "$workflow_json" > "$benchmark_dir/benchmark.json"
+    echo "$benchmark_workflow_json" > "$benchmark_dir/benchmark.json"
 }
 
 set_cleanup_job() {
@@ -921,44 +933,59 @@ main() {
     write_api_workflow
     set_cleanup_job
 
-    local pids=()
+    # ── 模型下载策略 ──────────────────────────────────────────────────────────
+    # benchmark 只需 wan_2.1_vae.safetensors（~388MB，几分钟下完）。
+    # 先同步下载 VAE，provisioning 退出后 benchmark 即可通过，实例进入 running 状态。
+    # 其余大模型（14B diffusion models / FLUX 24GB 等）写入后台脚本 nohup 继续下载，
+    # 避免 vast.ai provisioning timeout（约 10-30min）把实例误判 Error 销毁。
+    local vae_path="$MODELS_DIR/vae/wan_2.1_vae.safetensors"
+    log "Downloading benchmark-required model: wan_2.1_vae.safetensors (~388MB)..."
+    download_hf_file \
+        "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors" \
+        "$vae_path"
+    log "✓ wan_2.1_vae.safetensors ready"
 
-    for model in "${HF_MODELS[@]}"; do
-        url="${model%%|*}"
-        output_path="${model##*|}"
-        url=$(echo "$url" | xargs)
-        output_path=$(echo "$output_path" | xargs)
+    # 生成后台下载脚本（内联所需函数，用 nohup 脱离当前 session 独立运行）
+    local bg_log="${WORKSPACE_DIR}/bg_downloads.log"
+    local bg_script="${WORKSPACE_DIR}/bg_downloads.sh"
+    {
+        echo '#!/bin/bash'
+        echo "MODEL_LOG=$(printf '%q' "$bg_log")"
+        echo "HF_SEMAPHORE_DIR=$(printf '%q' "${WORKSPACE_DIR}/hf_bg_sem_$$")"
+        echo "HF_MAX_PARALLEL=${HF_MAX_PARALLEL}"
+        echo 'mkdir -p "$HF_SEMAPHORE_DIR"'
+        echo 'trap '"'"'rm -rf "$HF_SEMAPHORE_DIR"'"'"' EXIT'
+        declare -f log acquire_slot release_slot download_hf_file download_wget_file
+        echo 'pids=()'
+        for model in "${HF_MODELS[@]}"; do
+            local _url _out
+            _url="${model%%|*}"
+            _out="${model##*|}"
+            _url=$(echo "$_url" | xargs)
+            _out=$(echo "$_out" | xargs)
+            [[ "$_out" == "$vae_path" ]] && continue
+            echo "download_hf_file $(printf '%q' "$_url") $(printf '%q' "$_out") &"
+            echo 'pids+=($!)'
+        done
+        for item in "${WGET_DOWNLOADS[@]}"; do
+            [[ -z "${item// }" ]] && continue
+            local _url _out
+            _url="${item%%|*}"
+            _out="${item##*|}"
+            _url=$(echo "$_url" | xargs)
+            _out=$(echo "$_out" | xargs)
+            echo "download_wget_file $(printf '%q' "$_url") $(printf '%q' "$_out") &"
+            echo 'pids+=($!)'
+        done
+        echo 'for pid in "${pids[@]}"; do wait "$pid" || true; done'
+        echo "echo '[BG] All background downloads complete' | tee -a \"$bg_log\""
+    } > "$bg_script"
+    chmod +x "$bg_script"
+    log "Starting background downloads → $bg_log"
+    nohup "$bg_script" >> "$bg_log" 2>&1 &
+    disown $!
 
-        log "Queuing HF download: $url -> $output_path"
-        download_hf_file "$url" "$output_path" &
-        pids+=($!)
-    done
-
-    for item in "${WGET_DOWNLOADS[@]}"; do
-        [[ -z "${item// }" ]] && continue
-        url="${item%%|*}"
-        output_path="${item##*|}"
-        url=$(echo "$url" | xargs)
-        output_path=$(echo "$output_path" | xargs)
-
-        log "Queuing wget download: $url -> $output_path"
-        download_wget_file "$url" "$output_path" &
-        pids+=($!)
-    done
-
-    local failed=0
-    for pid in "${pids[@]}"; do
-        if ! wait "$pid"; then
-            log "[ERROR] Download process $pid failed"
-            failed=1
-        fi
-    done
-
-    if [ $failed -eq 1 ]; then
-        log "[WARN] One or more downloads failed (non-fatal)"
-    fi
-
-    log "✓ All downloads completed"
+    log "✓ Provisioning complete. Remaining models downloading in background (see $bg_log)"
 }
 
 main
