@@ -19,6 +19,8 @@ MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 HF_MODELS=(
   "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
   |$MODELS_DIR/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_bf16.safetensors
+  |$MODELS_DIR/text_encoders/umt5_xxl_bf16.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors
   |$MODELS_DIR/vae/wan_2.1_vae.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors
@@ -253,7 +255,7 @@ write_api_workflow() {
 {
     "90": {
         "inputs": {
-        "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        "clip_name": "umt5_xxl_bf16.safetensors",
         "type": "wan",
         "device": "default"
         },
