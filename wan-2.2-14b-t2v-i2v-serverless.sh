@@ -15,6 +15,10 @@ HF_MAX_PARALLEL=3
 WGET_MAX_PARALLEL=5
 MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 
+# HuggingFace Token（用于 gated repo 下载如 FLUX.1-dev，同时解除匿名限速）
+export HF_TOKEN="${HF_TOKEN:-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}"
+export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+
 # Model declarations: "URL|OUTPUT_PATH"
 HF_MODELS=(
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp16.safetensors
