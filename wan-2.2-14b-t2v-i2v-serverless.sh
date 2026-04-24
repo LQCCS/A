@@ -17,24 +17,22 @@ MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 
 # Model declarations: "URL|OUTPUT_PATH"
 HF_MODELS=(
-  "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
-  |$MODELS_DIR/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-  "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_bf16.safetensors
-  |$MODELS_DIR/text_encoders/umt5_xxl_bf16.safetensors"
+  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp16.safetensors
+  |$MODELS_DIR/text_encoders/umt5_xxl_fp16.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors
   |$MODELS_DIR/vae/wan_2.1_vae.safetensors"
-  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors
-  |$MODELS_DIR/diffusion_models/wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors"
-  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors
-  |$MODELS_DIR/diffusion_models/wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors"
+  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors
+  |$MODELS_DIR/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors"
+  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors
+  |$MODELS_DIR/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors
   |$MODELS_DIR/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors"
   "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors
   |$MODELS_DIR/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors"
-  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
-  |$MODELS_DIR/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
-  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
-  |$MODELS_DIR/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors
+  |$MODELS_DIR/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
+  "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors
+  |$MODELS_DIR/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
   # FLUX.1 dev fp8 (best open-source T2I)
   "https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-dev-fp8-e4m3fn.safetensors
   |$MODELS_DIR/diffusion_models/flux1-dev-fp8.safetensors"
@@ -255,7 +253,7 @@ write_api_workflow() {
 {
     "90": {
         "inputs": {
-        "clip_name": "umt5_xxl_bf16.safetensors",
+        "clip_name": "umt5_xxl_fp16.safetensors",
         "type": "wan",
         "device": "default"
         },
@@ -437,7 +435,7 @@ write_api_workflow() {
     },
     "101": {
         "inputs": {
-        "unet_name": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+        "unet_name": "wan2.2_t2v_high_noise_14B_fp16.safetensors",
         "weight_dtype": "default"
         },
         "class_type": "UNETLoader",
@@ -447,7 +445,7 @@ write_api_workflow() {
     },
     "102": {
         "inputs": {
-        "unet_name": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+        "unet_name": "wan2.2_t2v_low_noise_14B_fp16.safetensors",
         "weight_dtype": "default"
         },
         "class_type": "UNETLoader",
