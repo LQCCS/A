@@ -1042,10 +1042,14 @@ PYEOF
 
     local py_exit=$?
     if [[ $py_exit -eq 0 ]]; then
-        log "✓ patch_pyworker: worker.py 已打补丁（生效于 pyworker 下次重启时）"
-        # 注意：不在此处 pkill，因为 start_server.sh 重启时会重新 git clone pyworker 覆盖补丁。
-        # 补丁通过 /workspace/.pyworker_patched marker 做幂等保护，实际生效依赖 api-wrapper 降级。
+        log "✓ patch_pyworker: worker.py 已打补丁，重启 pyworker 使路由生效..."
         touch /workspace/.pyworker_patched
+        # start_server.sh 仅在 /.force_update 存在时才 git clone，普通重启不会覆盖补丁
+        supervisorctl restart start-server 2>/dev/null \
+            || supervisorctl restart pyworker 2>/dev/null \
+            || pkill -f 'workers.comfyui-json.worker' 2>/dev/null \
+            || true
+        log "✓ patch_pyworker: pyworker 已重启，/generate/async 路由生效"
     else
         log "[WARN] patch_pyworker: Python 补丁失败 (exit $py_exit)"
     fi
