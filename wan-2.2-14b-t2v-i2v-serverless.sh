@@ -249,8 +249,9 @@ download_hf_file() {
                 "$file_path" \
                 --local-dir "$temp_dir" \
                 --cache-dir "$temp_dir/.cache" \
-                $hf_token_arg 2>&1 | tee -a "$MODEL_LOG")
-            local dl_exit=${PIPESTATUS[0]}
+                $hf_token_arg 2>&1)
+            local dl_exit=$?
+            echo "$dl_output" | tee -a "$MODEL_LOG"
 
             # 403 GatedRepoError — 永久性权限错误，立即跳过不重试
             if echo "$dl_output" | grep -q "GatedRepoError\|403 Client Error\|Access to model.*is restricted"; then
@@ -1090,6 +1091,17 @@ main() {
     if [ -f /venv/main/bin/activate ]; then
         # shellcheck source=/dev/null
         . /venv/main/bin/activate
+    fi
+
+    # 确保 hf (huggingface-hub CLI) 在 PATH 中
+    # Vast.ai 将 hf 安装在 provisioner venv，系统 PATH 里没有
+    if ! command -v hf &>/dev/null; then
+        if [ -f /opt/instance-tools/provisioner/venv/bin/hf ]; then
+            export PATH="/opt/instance-tools/provisioner/venv/bin:$PATH"
+            log "Added /opt/instance-tools/provisioner/venv/bin to PATH for hf command"
+        else
+            log "[WARN] hf command not found and provisioner venv not present; HuggingFace downloads may fail"
+        fi
     fi
 
     rm -rf "$HF_SEMAPHORE_DIR"
