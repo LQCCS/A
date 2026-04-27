@@ -14,6 +14,8 @@ HF_SEMAPHORE_DIR="${WORKSPACE_DIR}/hf_download_sem_$$"
 HF_MAX_PARALLEL=3
 WGET_MAX_PARALLEL=5
 MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
+VERIFY_DECLARED_DOWNLOADS="${VERIFY_DECLARED_DOWNLOADS:-1}"
+ENFORCE_ALL_DECLARED_DOWNLOADS="${ENFORCE_ALL_DECLARED_DOWNLOADS:-0}"
 
 # HuggingFace Token（用于 gated repo 下载如 FLUX.1-dev，同时解除匿名限速）
 export HF_TOKEN="${HF_TOKEN:-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}"
@@ -74,6 +76,120 @@ log() {
     echo "$message" | tee -a "$MODEL_LOG"
 }
 
+is_optional_artifact() {
+    local output_path="$1"
+
+    case "$output_path" in
+        "$MODELS_DIR/diffusion_models/flux1-dev.safetensors"|
+        "$MODELS_DIR/diffusion_models/flux1-kontext-dev-fp8.safetensors"|
+        "$MODELS_DIR/loras/flux-realism-lora.safetensors")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_required_artifact() {
+    local output_path="$1"
+
+    if [ "$ENFORCE_ALL_DECLARED_DOWNLOADS" = "1" ]; then
+        return 0
+    fi
+
+    if is_optional_artifact "$output_path"; then
+        return 1
+    fi
+
+    return 0
+}
+
+has_valid_artifact() {
+    local output_path="$1"
+    [ -f "$output_path" ] && [ -s "$output_path" ]
+}
+
+prepare_output_path() {
+    local output_path="$1"
+
+    if has_valid_artifact "$output_path"; then
+        log "File already exists and is non-empty: $output_path (skipping)"
+        return 0
+    fi
+
+    if [ -e "$output_path" ]; then
+        log "[WARN] Removing empty or incomplete artifact before re-download: $output_path"
+        rm -f "$output_path"
+    fi
+
+    return 1
+}
+
+handle_download_failure() {
+    local output_path="$1"
+    local message="$2"
+
+    if is_required_artifact "$output_path"; then
+        log "[ERROR] $message"
+        return 1
+    fi
+
+    log "[WARN] $message"
+    return 0
+}
+
+verify_declared_artifacts() {
+    if [ "$VERIFY_DECLARED_DOWNLOADS" != "1" ]; then
+        log "Artifact verification disabled (VERIFY_DECLARED_DOWNLOADS=$VERIFY_DECLARED_DOWNLOADS)"
+        return 0
+    fi
+
+    local required_ok=0
+    local required_missing=0
+    local optional_ok=0
+    local optional_missing=0
+    local entry output_path
+
+    for entry in "${HF_MODELS[@]}"; do
+        output_path="${entry##*|}"
+        output_path=$(echo "$output_path" | xargs)
+
+        if has_valid_artifact "$output_path"; then
+            if is_required_artifact "$output_path"; then
+                required_ok=$((required_ok + 1))
+            else
+                optional_ok=$((optional_ok + 1))
+            fi
+        else
+            if is_required_artifact "$output_path"; then
+                log "[ERROR] Missing required artifact after download stage: $output_path"
+                required_missing=$((required_missing + 1))
+            else
+                log "[WARN] Optional artifact missing after download stage: $output_path"
+                optional_missing=$((optional_missing + 1))
+            fi
+        fi
+    done
+
+    for entry in "${WGET_DOWNLOADS[@]}"; do
+        [ -z "${entry// }" ] && continue
+        output_path="${entry##*|}"
+        output_path=$(echo "$output_path" | xargs)
+
+        if has_valid_artifact "$output_path"; then
+            required_ok=$((required_ok + 1))
+        else
+            log "[ERROR] Missing required artifact after download stage: $output_path"
+            required_missing=$((required_missing + 1))
+        fi
+    done
+
+    log "Artifact verification summary: required_ok=$required_ok required_missing=$required_missing optional_ok=$optional_ok optional_missing=$optional_missing"
+
+    [ "$required_missing" -eq 0 ]
+}
+
 script_cleanup() {
     log "Cleaning up semaphore directory..."
     rm -rf "$HF_SEMAPHORE_DIR"
@@ -101,8 +217,7 @@ download_hf_file() {
             exit 1
         fi
 
-        if [ -f "$output_path" ]; then
-            log "File already exists: $output_path (skipping)"
+        if prepare_output_path "$output_path"; then
             release_slot "$slot"
             exit 0
         fi
@@ -139,10 +254,10 @@ download_hf_file() {
 
             # 403 GatedRepoError — 永久性权限错误，立即跳过不重试
             if echo "$dl_output" | grep -q "GatedRepoError\|403 Client Error\|Access to model.*is restricted"; then
-                log "⚠️  Skipping $output_path — Gated Repo (403), set HF_TOKEN env var and accept terms on HuggingFace to enable download"
                 rm -rf "$temp_dir"
                 release_slot "$slot"
-                exit 0
+                handle_download_failure "$output_path" "$output_path unavailable due to gated repo restriction (403); accept terms on HuggingFace and provide HF_TOKEN to continue"
+                exit $?
             fi
 
             if [ $dl_exit -eq 0 ] && [ -f "$temp_dir/$file_path" ]; then
@@ -161,10 +276,10 @@ download_hf_file() {
             attempt=$((attempt + 1))
         done
 
-        log "[ERROR] Failed to download $output_path after $max_retries attempts"
         rm -rf "$temp_dir"
         release_slot "$slot"
-        exit 1
+        handle_download_failure "$output_path" "Failed to download $output_path after $max_retries attempts"
+        exit $?
     ) 200>"$lockfile"
 
     local result=$?
@@ -190,8 +305,7 @@ download_wget_file() {
             exit 1
         fi
 
-        if [ -f "$output_path" ]; then
-            log "File already exists: $output_path (skipping)"
+        if prepare_output_path "$output_path"; then
             release_slot "$slot"
             exit 0
         fi
@@ -228,10 +342,10 @@ download_wget_file() {
             attempt=$((attempt + 1))
         done
 
-        log "[ERROR] Failed to download $output_path after $max_retries attempts"
         rm -f "$temp_file"
         release_slot "$slot"
-        exit 1
+        handle_download_failure "$output_path" "Failed to download $output_path after $max_retries attempts"
+        exit $?
     ) 200>"$lockfile"
 
     local result=$?
@@ -942,6 +1056,7 @@ main() {
     # 全部同步下载完再退出，实例 benchmark 通过时所有模型均已就绪。
     log "Downloading all models (~95GB total, up to ${HF_MAX_PARALLEL} parallel)..."
     local all_pids=()
+    local failed_downloads=0
     for model in "${HF_MODELS[@]}"; do
         local _url _out
         _url="${model%%|*}"; _url=$(echo "$_url" | xargs)
@@ -957,8 +1072,27 @@ main() {
         download_wget_file "$_url" "$_out" &
         all_pids+=($!)
     done
-    for _pid in "${all_pids[@]}"; do wait "$_pid" || true; done
-    log "✓ All models downloaded. Provisioning complete."
+    for _pid in "${all_pids[@]}"; do
+        if ! wait "$_pid"; then
+            failed_downloads=$((failed_downloads + 1))
+        fi
+    done
+
+    if [ "$failed_downloads" -gt 0 ]; then
+        log "[ERROR] $failed_downloads download worker(s) failed"
+    fi
+
+    if ! verify_declared_artifacts; then
+        log "[ERROR] Download verification failed. Provisioning incomplete."
+        return 1
+    fi
+
+    if [ "$failed_downloads" -gt 0 ]; then
+        log "[ERROR] Download workers reported failures. Refusing to continue as if provisioning succeeded."
+        return 1
+    fi
+
+    log "✓ All required models downloaded and verified. Provisioning complete."
 }
 
 main
