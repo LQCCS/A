@@ -80,9 +80,7 @@ is_optional_artifact() {
     local output_path="$1"
 
     case "$output_path" in
-        "$MODELS_DIR/diffusion_models/flux1-dev.safetensors"|
-        "$MODELS_DIR/diffusion_models/flux1-kontext-dev-fp8.safetensors"|
-        "$MODELS_DIR/loras/flux-realism-lora.safetensors")
+        "$MODELS_DIR/diffusion_models/flux1-dev.safetensors"|"$MODELS_DIR/diffusion_models/flux1-kontext-dev-fp8.safetensors"|"$MODELS_DIR/loras/flux-realism-lora.safetensors")
             return 0
             ;;
         *)
