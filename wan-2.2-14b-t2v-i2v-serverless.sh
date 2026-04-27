@@ -415,7 +415,7 @@ write_api_workflow() {
         "inputs": {
         "shift": 8.000000000000002,
         "model": [
-            "101",
+            "105",
             0
         ]
         },
@@ -428,7 +428,7 @@ write_api_workflow() {
         "inputs": {
         "shift": 8,
         "model": [
-            "102",
+            "106",
             0
         ]
         },
@@ -441,11 +441,11 @@ write_api_workflow() {
         "inputs": {
         "add_noise": "disable",
         "noise_seed": 0,
-        "steps": 20,
-        "cfg": 3.5,
+        "steps": 4,
+        "cfg": 1.0,
         "sampler_name": "euler",
         "scheduler": "simple",
-        "start_at_step": 10,
+        "start_at_step": 2,
         "end_at_step": 10000,
         "return_with_leftover_noise": "disable",
         "model": [
@@ -474,12 +474,12 @@ write_api_workflow() {
         "inputs": {
         "add_noise": "enable",
         "noise_seed": "__RANDOM_INT__",
-        "steps": 20,
-        "cfg": 3.5,
+        "steps": 4,
+        "cfg": 1.0,
         "sampler_name": "euler",
         "scheduler": "simple",
         "start_at_step": 0,
-        "end_at_step": 10,
+        "end_at_step": 2,
         "return_with_leftover_noise": "enable",
         "model": [
             "93",
@@ -591,6 +591,44 @@ write_api_workflow() {
         "_meta": {
         "title": "EmptyHunyuanLatentVideo"
         }
+    },
+    "105": {
+        "inputs": {
+        "lora_name": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors",
+        "strength_model": 1.0,
+        "strength_clip": 1.0,
+        "model": [
+            "101",
+            0
+        ],
+        "clip": [
+            "90",
+            0
+        ]
+        },
+        "class_type": "LoraLoader",
+        "_meta": {
+        "title": "Load LoRA (LightX2V high noise)"
+        }
+    },
+    "106": {
+        "inputs": {
+        "lora_name": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors",
+        "strength_model": 1.0,
+        "strength_clip": 1.0,
+        "model": [
+            "102",
+            0
+        ],
+        "clip": [
+            "90",
+            0
+        ]
+        },
+        "class_type": "LoraLoader",
+        "_meta": {
+        "title": "Load LoRA (LightX2V low noise)"
+        }
     }
 }
 WORKFLOW_JSON
@@ -623,6 +661,39 @@ BENCH_EOF
     done
 
     echo "$benchmark_workflow_json" > "$benchmark_dir/benchmark.json"
+}
+
+verify_lightx2v() {
+    local high_noise="$MODELS_DIR/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors"
+    local low_noise="$MODELS_DIR/loras/wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors"
+    local payload="/opt/comfyui-api-wrapper/payloads/wan_2.2_i2v.json"
+    local ok=1
+
+    if [ -f "$high_noise" ] && [ -s "$high_noise" ]; then
+        log "✓ LightX2V: high_noise LoRA exists ($(du -sh "$high_noise" 2>/dev/null | cut -f1))"
+    else
+        log "[ERROR] LightX2V: high_noise LoRA missing: $high_noise"
+        ok=0
+    fi
+
+    if [ -f "$low_noise" ] && [ -s "$low_noise" ]; then
+        log "✓ LightX2V: low_noise LoRA exists ($(du -sh "$low_noise" 2>/dev/null | cut -f1))"
+    else
+        log "[ERROR] LightX2V: low_noise LoRA missing: $low_noise"
+        ok=0
+    fi
+
+    if grep -q 'lightx2v_4steps_lora' "$payload" 2>/dev/null; then
+        log "✓ LightX2V: workflow payload 引用了 LoRA 节点 (steps=4, cfg=1.0)"
+    else
+        log "[ERROR] LightX2V: workflow payload 未引用 LoRA 节点，检查 write_api_workflow"
+        ok=0
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        log "✓ LightX2V 4-step 推理已启用 (20step→4step, cfg 3.5→1.0，预计耗时从 15min→3min)"
+    fi
+    return $((1 - ok))
 }
 
 set_cleanup_job() {
@@ -1092,6 +1163,7 @@ main() {
         return 1
     fi
 
+    verify_lightx2v
     log "✓ All required models downloaded and verified. Provisioning complete."
 }
 
