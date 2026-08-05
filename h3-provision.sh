@@ -33,6 +33,20 @@ if ! command -v hf >/dev/null 2>&1; then
   export PATH="/opt/instance-tools/provisioner/venv/bin:/venv/main/bin:$PATH"
 fi
 HF_BIN="$(command -v hf || echo /venv/main/bin/hf)"
+HF_DIR="$(dirname "$HF_BIN")"
+
+# 下载提速：装 hf_transfer/hf_xet 加速器并开启。
+# - 高带宽机(多 Gbps)默认单流吃不满链路，hf_transfer 多流并行可快数倍；带宽已饱和的机无副作用。
+# - HF_XET_HIGH_PERFORMANCE 对 Xet 后端仓库(H3 即是)加速，缺包时被忽略、无害。
+# - HF_HUB_ENABLE_HF_TRANSFER 只在确认 hf_transfer 可 import 时才开，否则 hf 会因缺包直接报错、拖垮下载。
+"$HF_DIR/pip" install -q -U hf_transfer hf_xet >/dev/null 2>&1 || pip install -q -U hf_transfer hf_xet >/dev/null 2>&1 || true
+export HF_XET_HIGH_PERFORMANCE=1
+if "$HF_DIR/python" -c "import hf_transfer" >/dev/null 2>&1 || python -c "import hf_transfer" >/dev/null 2>&1; then
+  export HF_HUB_ENABLE_HF_TRANSFER=1
+  log "下载加速: hf_transfer + hf_xet 已启用"
+else
+  log "下载加速: 仅 hf_xet（hf_transfer 不可用，跳过以免 hf 报错）"
+fi
 
 download_one() {
   local f="$1" dest="$MODELS/$f" attempt=1 max=5 delay=4
