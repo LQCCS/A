@@ -122,6 +122,38 @@ install_reqs_guarded() {  # $1 = requirements.txt 路径
   return 0
 }
 
+# 依赖冒烟：constraints 冲突退化成逐包安装时会有包装不上，这里点名报出来——
+# 否则症状是"ComfyUI 里搜不到 Seed-VC 节点"，看不出缺谁。
+check_imports() {
+  log "依赖 import 冒烟测试..."
+  $PY - 2>&1 <<'PYEOF' | tee -a "$LOG"
+import importlib
+mods = ["torch", "torchaudio", "transformers", "librosa", "huggingface_hub", "munch",
+        "einops", "pydub", "dac", "soundfile", "sounddevice", "funasr", "hydra", "yaml", "dotenv"]
+bad = []
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        bad.append(f"{m}({type(e).__name__}: {str(e)[:80]})")
+print("[ERROR] import 失败: " + "; ".join(bad) if bad else "✓ 依赖 import 全通过")
+PYEOF
+}
+
+# 节点加载校验：ComfyUI 扫 custom_nodes 失败时会打
+# "Cannot import /workspace/ComfyUI/custom_nodes/ComfyUI_Seed-VC module for custom nodes: <原因>"
+check_node_loaded() {
+  sleep 25   # 等 comfyui 重启后把 custom_nodes 扫完
+  local hit
+  hit="$(grep -A3 -E "Cannot import.*ComfyUI_Seed-VC" "$LOG" 2>/dev/null | tail -6)"
+  if [ -n "$hit" ]; then
+    log "[ERROR] ComfyUI 加载 Seed-VC 节点失败，原因："
+    echo "$hit" | tee -a "$LOG"
+    return 1
+  fi
+  log "✓ ComfyUI 日志里没有 Seed-VC 导入失败记录"
+}
+
 torch_intact() {
   local before="$1" after
   after="$($PY -c 'import torch;print(torch.__version__)' 2>/dev/null)"
@@ -172,6 +204,7 @@ main() {
   install_reqs_guarded "$node/requirements.txt"
   install_rvc
   torch_intact "$torch_before"
+  check_imports
 
   # 3) 模型（约 3.4G）
   setup_hf
@@ -182,8 +215,9 @@ main() {
     download_one "$repo" "$f" "$dir" || failed=$((failed+1))
   done
 
-  # 4) 重启 comfyui（新节点/新模型要重启才认）
+  # 4) 重启 comfyui（新节点/新模型要重启才认）+ 确认节点真的被加载了
   supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
+  local node_ok=1; check_node_loaded || node_ok=0
 
   # 5) 校验
   local ok=1 spec2
@@ -192,8 +226,8 @@ main() {
     if [ -s "$dir/$f" ]; then log "OK  $(basename "$dir")/$f ($(du -h "$dir/$f" 2>/dev/null | cut -f1))"
     else log "[ERROR] 缺 $dir/$f"; ok=0; fi
   done
-  if [ "$failed" -gt 0 ] || [ "$ok" -ne 1 ]; then
-    log "[ERROR] 有模型没下成，provisioning 视为失败"; return 1
+  if [ "$failed" -gt 0 ] || [ "$ok" -ne 1 ] || [ "$node_ok" -ne 1 ]; then
+    log "[ERROR] provisioning 视为失败（模型缺失或节点没加载上）"; return 1
   fi
   log "===== ✓ Seed-VC provisioning 完成 ====="
   log "ComfyUI 里搜节点 'Seed-VC'；示例工作流: $node/workflow-examples/变声.json"
