@@ -19,7 +19,10 @@ CU="${WORKSPACE_DIR}/ComfyUI"
 MODELS="${CU}/models"
 NODES="${CU}/custom_nodes"
 TTS="${MODELS}/TTS"
-LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
+# ⚠️ 别写进 comfyui.log：supervisor 重启 comfyui 时会把它轮转成 comfyui.log.old，
+# 排查时最有用的前半段（torch 校验/依赖 import/下载过程）就从"那个日志"里消失了。
+# 用独立文件；同时 stdout 会被 vast 收进 /var/log/portal/provisioning.log，两边都全。
+LOG="${VC_PROVISION_LOG:-/var/log/portal/vc-provision.log}"
 mkdir -p "$(dirname "$LOG")"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
 
@@ -140,18 +143,32 @@ print("[ERROR] import 失败: " + "; ".join(bad) if bad else "✓ 依赖 import 
 PYEOF
 }
 
-# 节点加载校验：ComfyUI 扫 custom_nodes 失败时会打
-# "Cannot import /workspace/ComfyUI/custom_nodes/ComfyUI_Seed-VC module for custom nodes: <原因>"
+# 节点加载校验。
+# ⚠️ 不能查 ComfyUI 的 /object_info：provisioning 期间 /.provisioning 还在，comfyui.sh 会
+# "startup paused until instance provisioning has completed"，ComfyUI 压根没起，查必超时。
+# 也不能靠 grep comfyui.log（那时它还没扫过 custom_nodes，等于稳过 = 假阳性）。
+# 直接在 venv 里按文件路径 import 节点模块——依赖缺了/版本不对会在这里原地炸出 traceback。
 check_node_loaded() {
-  sleep 25   # 等 comfyui 重启后把 custom_nodes 扫完
-  local hit
-  hit="$(grep -A3 -E "Cannot import.*ComfyUI_Seed-VC" "$LOG" 2>/dev/null | tail -6)"
-  if [ -n "$hit" ]; then
-    log "[ERROR] ComfyUI 加载 Seed-VC 节点失败，原因："
-    echo "$hit" | tee -a "$LOG"
-    return 1
-  fi
-  log "✓ ComfyUI 日志里没有 Seed-VC 导入失败记录"
+  log "节点 import 校验..."
+  local out
+  out="$($PY - 2>&1 <<PYEOF
+import sys, importlib.util, traceback
+NODE = "$NODES/ComfyUI_Seed-VC"
+sys.path.insert(0, "$CU")     # folder_paths / comfy
+sys.path.insert(0, NODE)      # seed_vc 包（目录名带横杠，只能按路径加载）
+sys.argv = [sys.argv[0]]      # 别让 comfy.cli_args 吃到我们的参数
+try:
+    spec = importlib.util.spec_from_file_location("seedvcnode", NODE + "/seedvcnode.py")
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    names = list(getattr(m, "NODE_CLASS_MAPPINGS", {}))
+    print("✓ 节点 import 成功，注册: " + ", ".join(names) if names else "[ERROR] import 成功但无 NODE_CLASS_MAPPINGS")
+except Exception:
+    print("[ERROR] 节点 import 失败:"); traceback.print_exc()
+PYEOF
+)"
+  echo "$out" | tee -a "$LOG"
+  # 用本次输出判定，不是 grep 日志文件——重跑时旧的成功行会造成假阳性
+  echo "$out" | grep -q "✓ 节点 import 成功"
 }
 
 torch_intact() {
@@ -215,9 +232,15 @@ main() {
     download_one "$repo" "$f" "$dir" || failed=$((failed+1))
   done
 
-  # 4) 重启 comfyui（新节点/新模型要重启才认）+ 确认节点真的被加载了
-  supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
+  # 4) 节点校验 + 按需重启 comfyui
   local node_ok=1; check_node_loaded || node_ok=0
+  # 首次开机不用重启：vast 会在 provisioning 结束后自己起 comfyui，那时模型/节点都已就位。
+  # 只有在已跑起来的机器上重跑本脚本（更新节点/补模型）时才需要重启去刷新。
+  if [ -f /.provisioning ]; then
+    log "首次开机：comfyui 由 vast 在 provisioning 结束后自动启动，不重启"
+  else
+    supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
+  fi
 
   # 5) 校验
   local ok=1 spec2
