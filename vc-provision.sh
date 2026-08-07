@@ -143,6 +143,42 @@ print("[ERROR] import 失败: " + "; ".join(bad) if bad else "✓ 依赖 import 
 PYEOF
 }
 
+# Seed-VC 自带的 BigVGAN 兼容不了 huggingface_hub >= 1.0（镜像里是 1.18）：
+#   TypeError: BigVGAN._from_pretrained() missing 2 required keyword-only arguments:
+#              'proxies' and 'resume_download'
+# hub 1.x 的 ModelHubMixin.from_pretrained 只传 model_id/revision/cache_dir/
+# force_download/local_files_only/token，不再传 proxies/resume_download，而这份 vendored
+# BigVGAN 把这两个声明成【必填】keyword-only 参数 → 一调用就炸。hf_hub_download 那边
+# 也删了 resume_download，顺手清掉（我们走本地目录、碰不到那条分支，但留着是雷）。
+# 不能靠降级 hub：transformers 5.x 要 hub>=1.0，降了 whisper 就废了。
+# 幂等，git pull 把文件冲掉后重跑本脚本会重新打。
+patch_bigvgan_hub_compat() {
+  local f="$NODES/ComfyUI_Seed-VC/seed_vc/modules/bigvgan/bigvgan.py"
+  [ -f "$f" ] || { log "[WARN] 找不到 bigvgan.py，跳过 hub 兼容补丁"; return 0; }
+  local out
+  out="$($PY - "$f" 2>&1 <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+orig = src
+# keyword-only 参数允许"有默认"排在"无默认"前面，所以只补默认值就够，不用重排
+src = re.sub(r"(\n(\s*))proxies:\s*Optional\[Dict\],(\s*\n\s*)resume_download:\s*bool,",
+             r"\1proxies: Optional[Dict] = None,\3resume_download: bool = False,", src, count=1)
+src = re.sub(r"\n\s*resume_download=resume_download,", "", src)
+src = re.sub(r"\n\s*proxies=proxies,", "", src)
+if src != orig:
+    open(p, "w", encoding="utf-8").write(src)
+    print("BigVGAN hub 兼容补丁：已打")
+else:
+    print("BigVGAN hub 兼容补丁：无需改动（已是兼容版或上游已修）")
+ok = ("proxies: Optional[Dict] = None," in src) and ("resume_download: bool = False," in src)
+print("✓ BigVGAN 签名已兼容 hub>=1.0" if ok else "[ERROR] BigVGAN 签名仍不兼容，SeedVCRun 一跑就会 TypeError")
+PYEOF
+)"
+  echo "$out" | tee -a "$LOG"
+  echo "$out" | grep -q "✓ BigVGAN 签名已兼容"
+}
+
 # 节点加载校验。
 # ⚠️ 不能查 ComfyUI 的 /object_info：provisioning 期间 /.provisioning 还在，comfyui.sh 会
 # "startup paused until instance provisioning has completed"，ComfyUI 压根没起，查必超时。
@@ -218,6 +254,7 @@ main() {
     git clone --depth 1 https://github.com/billwuhao/ComfyUI_Seed-VC "$node" 2>&1 | tail -1 | tee -a "$LOG"
   fi
   [ -f "$node/requirements.txt" ] || { log "[ERROR] clone 失败，没有 requirements.txt"; return 1; }
+  local bigvgan_ok=1; patch_bigvgan_hub_compat || bigvgan_ok=0
   install_reqs_guarded "$node/requirements.txt"
   install_rvc
   torch_intact "$torch_before"
@@ -249,8 +286,8 @@ main() {
     if [ -s "$dir/$f" ]; then log "OK  $(basename "$dir")/$f ($(du -h "$dir/$f" 2>/dev/null | cut -f1))"
     else log "[ERROR] 缺 $dir/$f"; ok=0; fi
   done
-  if [ "$failed" -gt 0 ] || [ "$ok" -ne 1 ] || [ "$node_ok" -ne 1 ]; then
-    log "[ERROR] provisioning 视为失败（模型缺失或节点没加载上）"; return 1
+  if [ "$failed" -gt 0 ] || [ "$ok" -ne 1 ] || [ "$node_ok" -ne 1 ] || [ "$bigvgan_ok" -ne 1 ]; then
+    log "[ERROR] provisioning 视为失败（模型缺失 / 节点没加载上 / BigVGAN 不兼容 hub）"; return 1
   fi
   log "===== ✓ Seed-VC provisioning 完成 ====="
   log "ComfyUI 里搜节点 'Seed-VC'；示例工作流: $node/workflow-examples/变声.json"
