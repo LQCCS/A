@@ -28,8 +28,10 @@ PY=/venv/main/bin/python
 PIP=/venv/main/bin/pip
 
 # ── 模型清单：(HF仓库, 仓库内路径, 落位目录) ──────────────────────────────────
+# ⚠️ 文件在仓库的 frame_interpolation/ 子目录下，下载路径必须带该前缀（根目录没有→404）。
+# --local-dir 用 models：hf 会保留仓库子目录结构 → 正好落到 models/frame_interpolation/。
 MODEL_SPECS=(
-  "Comfy-Org/frame_interpolation|rife_v4.26.safetensors|${INTERP}"   # 22.7MB RIFE 权重
+  "Comfy-Org/frame_interpolation|frame_interpolation/rife_v4.26.safetensors|${MODELS}"   # 22.7MB RIFE 权重
 )
 
 # ── hf CLI（vast 装在 provisioner venv，系统 PATH 里未必有）+ 下载加速 ────────
