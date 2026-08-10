@@ -19,11 +19,12 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
 # H3 出片集（== AVPE h3_i2v_api.json 用的 TE+VAE + 一个 DiT）。仓库路径，落位到 $MODELS/<路径>。
 # 公开仓库，不需要 HF_TOKEN；如模板里设了 HF_TOKEN 会自动用（解除匿名限速、下得更快）。
 HF_REPO="Comfy-Org/MiniMax-H3"
-# DiT 由 rent 脚本/模板的 -e H3_DIT_FILE 指定（**每实例只下这一个**）；不设=默认 int8_convrot（保手动起机不受影响）。
+# DiT 由 rent 脚本/模板的 -e H3_DIT_FILE 指定（**逗号分隔 1~2 个**，2 个用于同机对照实验）；
+# 不设=默认 int8_convrot（保手动起机不受影响）。⚠️ rent 脚本租后还会 SSH 强制校正一次，这里只是快路径。
 # 可选: ref2va_int8_convrot(34G) / bf16(66G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
-H3_DIT_FILE="${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
+IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
 H3_FILES=(
-  "$H3_DIT_FILE"                                                   # 选中的 DiT（每实例只下一个）
+  "${_DITS[@]}"                                                    # 选中的 DiT（1~2 个，逗号分隔）
   "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"         # bf16 TE ~51.5G
   "vae/minimax_h3_video_vae_fp16.safetensors"                     # ~5.2G
   "vae/minimax_h3_audio_vae_fp32.safetensors"                     # ~0.6G
@@ -79,8 +80,8 @@ main() {
     log "[ERROR] H3 节点缺失（checkout v0.30 失败？）——工作流会报 node 缺失"
   fi
 
-  # 2) 下模型：选中的 DiT + TE + VAE（hf download 自动处理 HF 的 Xet 重定向 + 大文件）
-  log "下模型（DiT=${H3_DIT_FILE##*/} + TE + VAE）..."
+  # 2) 下模型：选中的 DiT(1~2个) + TE + VAE（hf download 自动处理 HF 的 Xet 重定向 + 大文件）
+  log "下模型（DiT×${#_DITS[@]} + TE + VAE）..."
   local failed=0
   for f in "${H3_FILES[@]}"; do download_one "$f" || failed=$((failed+1)); done
 
