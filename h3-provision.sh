@@ -16,17 +16,18 @@ LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 mkdir -p "$(dirname "$LOG")"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
 
-# H3 int8 出片集（== AVPE h3_i2v_api.json 实际用的）。仓库路径，落位到 $MODELS/<路径>。
+# H3 出片集（== AVPE h3_i2v_api.json 用的 TE+VAE + 一个 DiT）。仓库路径，落位到 $MODELS/<路径>。
 # 公开仓库，不需要 HF_TOKEN；如模板里设了 HF_TOKEN 会自动用（解除匿名限速、下得更快）。
 HF_REPO="Comfy-Org/MiniMax-H3"
+# DiT 由 rent 脚本/模板的 -e H3_DIT_FILE 指定（**每实例只下这一个**）；不设=默认 int8_convrot（保手动起机不受影响）。
+# 可选: ref2va_int8_convrot(34G) / bf16(66G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
+H3_DIT_FILE="${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
 H3_FILES=(
-  "diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors"   # int8 DiT ~34G
+  "$H3_DIT_FILE"                                                   # 选中的 DiT（每实例只下一个）
   "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"         # bf16 TE ~51.5G
   "vae/minimax_h3_video_vae_fp16.safetensors"                     # ~5.2G
   "vae/minimax_h3_audio_vae_fp32.safetensors"                     # ~0.6G
 )
-# 想额外要 bf16 DiT 做 UNETLoader 下拉 parity，把下面这行取消注释（多 66G、多下几分钟）：
-# H3_FILES+=("diffusion_models/minimax_h3_ref2va_bf16.safetensors")
 
 # hf CLI：vast 把它装在 provisioner venv，系统 PATH 里未必有
 if ! command -v hf >/dev/null 2>&1; then
@@ -78,8 +79,8 @@ main() {
     log "[ERROR] H3 节点缺失（checkout v0.30 失败？）——工作流会报 node 缺失"
   fi
 
-  # 2) 下 int8 出片集（hf download 自动处理 HF 的 Xet 重定向 + 大文件）
-  log "下模型（int8 集，约 92G）..."
+  # 2) 下模型：选中的 DiT + TE + VAE（hf download 自动处理 HF 的 Xet 重定向 + 大文件）
+  log "下模型（DiT=${H3_DIT_FILE##*/} + TE + VAE）..."
   local failed=0
   for f in "${H3_FILES[@]}"; do download_one "$f" || failed=$((failed+1)); done
 
