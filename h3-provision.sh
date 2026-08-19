@@ -142,8 +142,10 @@ download_one() {
   while [ $attempt -le $max ]; do
     part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
     log "直连下载 $f (第 $attempt/$max 次，续传 $part_got/$expected)..."
+    # Keep retries outside curl: before every attempt we re-read .partial's
+    # current size.  curl's internal retry can reuse a stale -C offset and
+    # append an overlapping tail after a transient connection failure.
     if timeout 1800 curl --fail --location --continue-at - \
-        --retry 3 --retry-delay 5 --retry-all-errors \
         --connect-timeout 30 --speed-time 120 --speed-limit 1048576 \
         --progress-bar --output "$part" "$url" 2>&1 | tail -3 | tee -a "$LOG"; then
       got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
@@ -198,6 +200,13 @@ main() {
   #    ⚠️ 旧版 hf CLI 可能没有 --max-workers → 先探测，没有就直接走下面的逐个兜底。
   #    ⚠️ 兜底保留：并行跑完后仍逐个检查，缺谁就用 download_one 单独补（含 5 次退避重试）。
   log "下模型（DiT×${#_DITS[@]} + TE + VAE）— 并行..."
+  mkdir -p "$MODELS"
+  exec 9>"$MODELS/.h3-download.lock"
+  log "等待 H3 模型下载锁（防多个安装器同时写同一个 .partial）..."
+  if ! flock -w "${H3_DOWNLOAD_LOCK_TIMEOUT:-2700}" 9; then
+    log "[ERROR] 等待 H3 模型下载锁超时"; return 1
+  fi
+  log "已取得 H3 模型下载锁"
   local missing=()
   for f in "${H3_FILES[@]}"; do h3_file_complete "$f" || missing+=("$f"); done
   if [ ${#missing[@]} -gt 0 ] && "$HF_BIN" download --help 2>&1 | grep -q -- "--max-workers"; then
@@ -212,6 +221,7 @@ main() {
   for f in "${H3_FILES[@]}"; do
     h3_file_complete "$f" || download_one "$f" || failed=$((failed+1))
   done
+  flock -u 9 || true
 
   # 3) 重启 comfyui 刷新 UNETLoader/CLIPLoader 列表（新下的模型才认得出）
   supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true

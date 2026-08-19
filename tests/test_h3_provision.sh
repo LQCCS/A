@@ -27,9 +27,12 @@ cat > "$ROOT/stub/curl" <<'STUB'
 #!/bin/bash
 out=''
 url=''
+has_internal_retry=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output|-o) out="$2"; shift 2 ;;
+    --retry|--retry-delay) has_internal_retry=1; shift 2 ;;
+    --retry-all-errors) has_internal_retry=1; shift ;;
     *) url="$1"; shift ;;
   esac
 done
@@ -42,8 +45,27 @@ case "${url##*/}" in
 esac
 [ -n "$out" ] || { echo 'missing curl output path' >&2; exit 2; }
 mkdir -p "$(dirname "$out")"
-head -c "$size" /dev/zero > "$out"
+if [ "$has_internal_retry" -eq 1 ]; then
+  # Characterize curl -C - + --retry after a transient transfer: a retry can
+  # append an overlapping tail because the resume offset is not recalculated.
+  head -c "$size" /dev/zero > "$out"
+  printf x >> "$out"
+  echo 'stub-overlapping-internal-retry' >&2
+  exit 0
+fi
+got=$(stat -c '%s' "$out" 2>/dev/null || echo 0)
+if [ "$got" -eq 0 ]; then
+  head -c "$((size / 2))" /dev/zero > "$out"
+  echo 'stub-transient-transfer-error' >&2
+  exit 18
+fi
+head -c "$((size - got))" /dev/zero >> "$out"
 echo "stub-http-206 ${url##*/} bytes=$size"
+STUB
+
+cat > "$ROOT/stub/flock" <<'STUB'
+#!/bin/bash
+exit 0
 STUB
 
 cat > "$ROOT/stub/pip" <<'STUB'
@@ -122,4 +144,4 @@ do
 done
 
 printf '%s\n' "$output"
-echo 'PASS: hf failure fell back to exact, atomically installed HTTP downloads'
+echo 'PASS: outer retries resume exact atomic HTTP downloads without overlapping tails'
