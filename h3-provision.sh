@@ -42,17 +42,32 @@ HF_DIR="$(dirname "$HF_BIN")"
 # - HF_XET_HIGH_PERFORMANCE 对 Xet 后端仓库(H3 即是)加速，缺包时被忽略、无害。
 # - HF_HUB_ENABLE_HF_TRANSFER 只在确认 hf_transfer 可 import 时才开，否则 hf 会因缺包直接报错、拖垮下载。
 "$HF_DIR/pip" install -q -U hf_transfer hf_xet >/dev/null 2>&1 || pip install -q -U hf_transfer hf_xet >/dev/null 2>&1 || true
-export HF_XET_HIGH_PERFORMANCE=1        # Xet 高性能模式：提高并发上限 + 加大缓冲，对 H3(Xet 后端仓库)有效
-export HF_XET_NUM_CONCURRENT_RANGE_GETS="${HF_XET_NUM_CONCURRENT_RANGE_GETS:-32}"   # 并发 range 请求，默认 16
-# ⚠️ **huggingface_hub 1.0+ 已把 HF_HUB_ENABLE_HF_TRANSFER 静默忽略**（Xet 后端取代了 hf_transfer）。
-#    所以下面这行在新版上是**空操作**——保留只为兼容老版本，别再把它当成"加速已开启"的证据。
-#    真正起作用的是 Xet 的自适应并发(1→64 流) + 上面两个 HF_XET_* 变量 + 下载时的 --max-workers。
+
+# ══ 🔴 关掉 Xet（2026-08-19 根因定案，别再打开）══════════════════════════════════
+# 症状：实例 48068790 下 bf16(66.3G)，**两次都停在 65.68/66.28 GB(99.1%) 后永不返回**：
+#       socket 停在 CLOSE-WAIT、主线程死在 futex_wait_queue、38 线程、进程活着但零进展。
+#       且 Xet 每次开新会话不续传 → 缓存里堆了两份 65.7G 残件（131G 垃圾）。
+# 根因：huggingface/xet-core#789（独立用户抓包）——
+#       "**Xet CDN 在大规模下乱序投递 chunk**，TCP 全部时间用于重排，**拥塞窗口冻结在 10 永不扩张**，
+#        最终某条连接进入 timeout 地狱"。证据：每连接数千 rcv_ooopack、RTT 794ms/抖动 598ms。
+#       维护者未回应、**无修复**。官方唯一 workaround 就是 HF_HUB_DISABLE_XET=1。
+# 实测对比（同一台机 48068790，同一个 66.3G 文件）：
+#       Xet      ~127 MB/s 且 **卡死在 99% 两次**
+#       非 Xet    **293 MB/s，3分35秒跑完，字节数精确**
+# ⚠️ 教训：8/18 我曾把 HF_XET_NUM_CONCURRENT_RANGE_GETS 从 16 提到 32、并加多文件并发，
+#         **方向完全反了**——并发越高乱序越重、越容易触发拥塞崩溃。已撤销。
+#         当时"串行没吃满带宽"的诊断也是错的：瓶颈从来不是串行，是 Xet 本身。
+export HF_HUB_DISABLE_XET=1
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"   # 大分片建议加长，见 hub#3580
+unset HF_XET_HIGH_PERFORMANCE HF_XET_NUM_CONCURRENT_RANGE_GETS 2>/dev/null || true
 _HUBVER="$("$HF_DIR/python" -c 'import huggingface_hub as h;print(h.__version__)' 2>/dev/null || echo '?')"
+# hf_transfer：huggingface_hub 1.0+ 已**静默忽略**它（Xet 取代）。Xet 关掉后走普通 HTTPS，
+# 老版本上 hf_transfer 仍能多流提速，故保留探测；新版上它是空操作，别当成"加速已开启"的证据。
 if "$HF_DIR/python" -c "import hf_transfer" >/dev/null 2>&1 || python -c "import hf_transfer" >/dev/null 2>&1; then
   export HF_HUB_ENABLE_HF_TRANSFER=1
-  log "下载加速: hf_xet(高性能, range=${HF_XET_NUM_CONCURRENT_RANGE_GETS}) + hf_transfer(hub=${_HUBVER}，1.0+ 上被忽略)"
+  log "下载: **Xet 已禁用**(xet-core#789 拥塞崩溃) + hf_transfer(hub=${_HUBVER}，1.0+ 上被忽略) timeout=${HF_HUB_DOWNLOAD_TIMEOUT}s"
 else
-  log "下载加速: 仅 hf_xet(高性能, range=${HF_XET_NUM_CONCURRENT_RANGE_GETS})，hub=${_HUBVER}"
+  log "下载: **Xet 已禁用**(xet-core#789 拥塞崩溃)，普通 HTTPS，hub=${_HUBVER} timeout=${HF_HUB_DOWNLOAD_TIMEOUT}s"
 fi
 
 download_one() {
