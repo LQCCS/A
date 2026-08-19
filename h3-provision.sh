@@ -30,6 +30,30 @@ H3_FILES=(
   "vae/minimax_h3_audio_vae_fp32.safetensors"                     # ~0.6G
 )
 
+# Hugging Face 仓库元数据给出的精确字节数。下载完成不能只看 -s：中断留下的半截文件也非空。
+h3_expected_bytes() {
+  case "$1" in
+    diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors)        echo 34038894550 ;;
+    diffusion_models/minimax_h3_ref2va_bf16.safetensors)                echo 66280487368 ;;
+    diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors)         echo 40225724176 ;;
+    diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) echo 20970379616 ;;
+    diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors)   echo 20958205608 ;;
+    text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors)              echo 51506295256 ;;
+    vae/minimax_h3_video_vae_fp16.safetensors)                           echo 5207808496 ;;
+    vae/minimax_h3_audio_vae_fp32.safetensors)                           echo 605254808 ;;
+    *) return 1 ;;
+  esac
+}
+
+h3_file_complete() {
+  local f="$1"
+  local expected got
+  expected="$(h3_expected_bytes "$f")" || return 1
+  [ -f "$MODELS/$f" ] || return 1
+  got="$(stat -c %s "$MODELS/$f" 2>/dev/null || echo 0)"
+  [ "$got" = "$expected" ]
+}
+
 # hf CLI：vast 把它装在 provisioner venv，系统 PATH 里未必有
 if ! command -v hf >/dev/null 2>&1; then
   export PATH="/opt/instance-tools/provisioner/venv/bin:/venv/main/bin:$PATH"
@@ -43,13 +67,13 @@ HF_DIR="$(dirname "$HF_BIN")"
 # - HF_HUB_ENABLE_HF_TRANSFER 只在确认 hf_transfer 可 import 时才开，否则 hf 会因缺包直接报错、拖垮下载。
 "$HF_DIR/pip" install -q -U hf_transfer hf_xet >/dev/null 2>&1 || pip install -q -U hf_transfer hf_xet >/dev/null 2>&1 || true
 
-# ══ 🔴 关掉 Xet（2026-08-19）══════════════════════════════════════════════════
+# ══ 🔴 关掉 Xet，超大文件改走可续传直连（2026-08-19）══════════════════════════
 # ① 决定的依据 = **本地实测**（这一条最硬，与下面的机制假说无关）：
 #    实例 48068790，同一台机、同一个 66.3G 文件：
 #      Xet   → **2/2 卡死在 65.68/66.28 GB(99.1%) 后永不返回**
 #              socket CLOSE-WAIT、主线程 futex_wait_queue、38 线程、35min 只 76 次上下文切换；
 #              且**不续传**（两个 incomplete 后缀不同），缓存堆了两份 65.7G = 131G 垃圾。
-#      非Xet → **1/1 成功，293 MB/s，3分35秒，字节数精确 66,280,487,368**
+#      非Xet直连 → **1/1 成功，293 MB/s，3分35秒，字节数精确 66,280,487,368**
 #    → 关 Xet 不但不慢，反而快 ~2.3×。**这个决定不依赖任何外部解释。**
 #
 # ② 社区状况：**症状广泛复现，但机制无定论、零维护者确认**（别把任何一条当真理）：
@@ -69,6 +93,8 @@ unset HF_XET_HIGH_PERFORMANCE HF_XET_NUM_CONCURRENT_RANGE_GETS 2>/dev/null || tr
 _HUBVER="$("$HF_DIR/python" -c 'import huggingface_hub as h;print(h.__version__)' 2>/dev/null || echo '?')"
 # hf_transfer：huggingface_hub 1.0+ 已**静默忽略**它（Xet 取代）。Xet 关掉后走普通 HTTPS，
 # 老版本上 hf_transfer 仍能多流提速，故保留探测；新版上它是空操作，别当成"加速已开启"的证据。
+# 关键限制：huggingface_hub 1.18 的普通下载代码会硬拒绝 >50GB；TE=51.5GB、bf16 DiT=66.3GB。
+# 因此 hf 只作并行快路径，任何未落盘文件一律由下面 curl 直连兜底，绕开客户端大小门槛。
 if "$HF_DIR/python" -c "import hf_transfer" >/dev/null 2>&1 || python -c "import hf_transfer" >/dev/null 2>&1; then
   export HF_HUB_ENABLE_HF_TRANSFER=1
   log "下载: **Xet 已禁用**(xet-core#789 拥塞崩溃) + hf_transfer(hub=${_HUBVER}，1.0+ 上被忽略) timeout=${HF_HUB_DOWNLOAD_TIMEOUT}s"
@@ -77,17 +103,61 @@ else
 fi
 
 download_one() {
-  local f="$1" dest="$MODELS/$f" attempt=1 max=5 delay=4
-  if [ -s "$dest" ]; then log "已存在，跳过: $f"; return 0; fi
+  local f="$1"
+  local dest="$MODELS/$f"
+  local part="${dest}.partial"
+  local expected got part_got
+  local attempt=1 max=4 delay=4
+  local url="https://huggingface.co/${HF_REPO}/resolve/main/${f}"
+
+  expected="$(h3_expected_bytes "$f")" || {
+    log "[ERROR] 未登记精确字节数: $f"; return 1;
+  }
+  if h3_file_complete "$f"; then log "已存在且字节数正确，跳过: $f"; return 0; fi
   mkdir -p "$(dirname "$dest")"
-  while [ $attempt -le $max ]; do
-    log "下载 $f (第 $attempt/$max 次)..."
-    if "$HF_BIN" download "$HF_REPO" "$f" --local-dir "$MODELS" 2>&1 | tail -3 | tee -a "$LOG"; then
-      [ -s "$dest" ] && { log "✓ $f"; return 0; }
+
+  # 若最终路径上是可续传的短文件，先退回 .partial；超大/未知文件不覆盖，避免误伤。
+  if [ -f "$dest" ]; then
+    got="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
+    if [ "$got" -lt "$expected" ]; then
+      if [ -f "$part" ]; then
+        part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+        if [ "$got" -gt "$part_got" ]; then mv -f "$dest" "$part"; else rm -f "$dest"; fi
+      else
+        mv "$dest" "$part"
+      fi
+      log "检测到未完整文件，转为断点续传: $f ($got/$expected)"
+    else
+      log "[ERROR] 文件字节数异常且不可续传: $f ($got/$expected)"; return 1
     fi
-    log "✗ $f 失败，${delay}s 后重试..."; sleep $delay; delay=$((delay*2)); attempt=$((attempt+1))
+  fi
+
+  if [ -f "$part" ]; then
+    part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+    if [ "$part_got" -gt "$expected" ]; then
+      log "[ERROR] 临时文件超过预期，拒绝覆盖: $f ($part_got/$expected)"; return 1
+    fi
+  fi
+
+  while [ $attempt -le $max ]; do
+    part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+    log "直连下载 $f (第 $attempt/$max 次，续传 $part_got/$expected)..."
+    if timeout 1800 curl --fail --location --continue-at - \
+        --retry 3 --retry-delay 5 --retry-all-errors \
+        --connect-timeout 30 --speed-time 120 --speed-limit 1048576 \
+        --progress-bar --output "$part" "$url" 2>&1 | tail -3 | tee -a "$LOG"; then
+      got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+      if [ "$got" = "$expected" ]; then
+        mv "$part" "$dest"
+        log "✓ $f ($got B)"
+        return 0
+      fi
+    fi
+    got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+    log "✗ $f 未完整 ($got/$expected)，${delay}s 后续传..."
+    sleep $delay; delay=$((delay*2)); attempt=$((attempt+1))
   done
-  log "[ERROR] 放弃: $f（$max 次都失败）"; return 1
+  log "[ERROR] 放弃: $f（$max 次都未达到精确字节数）"; return 1
 }
 
 main() {
@@ -129,7 +199,7 @@ main() {
   #    ⚠️ 兜底保留：并行跑完后仍逐个检查，缺谁就用 download_one 单独补（含 5 次退避重试）。
   log "下模型（DiT×${#_DITS[@]} + TE + VAE）— 并行..."
   local missing=()
-  for f in "${H3_FILES[@]}"; do [ -s "$MODELS/$f" ] || missing+=("$f"); done
+  for f in "${H3_FILES[@]}"; do h3_file_complete "$f" || missing+=("$f"); done
   if [ ${#missing[@]} -gt 0 ] && "$HF_BIN" download --help 2>&1 | grep -q -- "--max-workers"; then
     log "并行拉 ${#missing[@]} 个文件（--max-workers ${H3_DL_WORKERS:-4}）"
     "$HF_BIN" download "$HF_REPO" "${missing[@]}" --local-dir "$MODELS" \
@@ -140,7 +210,7 @@ main() {
   fi
   local failed=0
   for f in "${H3_FILES[@]}"; do
-    [ -s "$MODELS/$f" ] || download_one "$f" || failed=$((failed+1))
+    h3_file_complete "$f" || download_one "$f" || failed=$((failed+1))
   done
 
   # 3) 重启 comfyui 刷新 UNETLoader/CLIPLoader 列表（新下的模型才认得出）
@@ -149,8 +219,11 @@ main() {
   # 4) 校验
   local ok=1
   for f in "${H3_FILES[@]}"; do
-    if [ -s "$MODELS/$f" ]; then log "OK  $f ($(du -h "$MODELS/$f" 2>/dev/null | cut -f1))"
-    else log "[ERROR] 缺 $f"; ok=0; fi
+    local expected got
+    expected="$(h3_expected_bytes "$f")" || expected=unknown
+    got="$(stat -c %s "$MODELS/$f" 2>/dev/null || echo missing)"
+    if h3_file_complete "$f"; then log "OK  $f ($got B)"
+    else log "[ERROR] 文件缺失/不完整 $f ($got/$expected)"; ok=0; fi
   done
   if [ "$failed" -gt 0 ] || [ "$ok" -ne 1 ]; then
     log "[ERROR] 有模型没下成，provisioning 视为失败"; return 1
