@@ -43,20 +43,26 @@ HF_DIR="$(dirname "$HF_BIN")"
 # - HF_HUB_ENABLE_HF_TRANSFER 只在确认 hf_transfer 可 import 时才开，否则 hf 会因缺包直接报错、拖垮下载。
 "$HF_DIR/pip" install -q -U hf_transfer hf_xet >/dev/null 2>&1 || pip install -q -U hf_transfer hf_xet >/dev/null 2>&1 || true
 
-# ══ 🔴 关掉 Xet（2026-08-19 根因定案，别再打开）══════════════════════════════════
-# 症状：实例 48068790 下 bf16(66.3G)，**两次都停在 65.68/66.28 GB(99.1%) 后永不返回**：
-#       socket 停在 CLOSE-WAIT、主线程死在 futex_wait_queue、38 线程、进程活着但零进展。
-#       且 Xet 每次开新会话不续传 → 缓存里堆了两份 65.7G 残件（131G 垃圾）。
-# 根因：huggingface/xet-core#789（独立用户抓包）——
-#       "**Xet CDN 在大规模下乱序投递 chunk**，TCP 全部时间用于重排，**拥塞窗口冻结在 10 永不扩张**，
-#        最终某条连接进入 timeout 地狱"。证据：每连接数千 rcv_ooopack、RTT 794ms/抖动 598ms。
-#       维护者未回应、**无修复**。官方唯一 workaround 就是 HF_HUB_DISABLE_XET=1。
-# 实测对比（同一台机 48068790，同一个 66.3G 文件）：
-#       Xet      ~127 MB/s 且 **卡死在 99% 两次**
-#       非 Xet    **293 MB/s，3分35秒跑完，字节数精确**
-# ⚠️ 教训：8/18 我曾把 HF_XET_NUM_CONCURRENT_RANGE_GETS 从 16 提到 32、并加多文件并发，
-#         **方向完全反了**——并发越高乱序越重、越容易触发拥塞崩溃。已撤销。
-#         当时"串行没吃满带宽"的诊断也是错的：瓶颈从来不是串行，是 Xet 本身。
+# ══ 🔴 关掉 Xet（2026-08-19）══════════════════════════════════════════════════
+# ① 决定的依据 = **本地实测**（这一条最硬，与下面的机制假说无关）：
+#    实例 48068790，同一台机、同一个 66.3G 文件：
+#      Xet   → **2/2 卡死在 65.68/66.28 GB(99.1%) 后永不返回**
+#              socket CLOSE-WAIT、主线程 futex_wait_queue、38 线程、35min 只 76 次上下文切换；
+#              且**不续传**（两个 incomplete 后缀不同），缓存堆了两份 65.7G = 131G 垃圾。
+#      非Xet → **1/1 成功，293 MB/s，3分35秒，字节数精确 66,280,487,368**
+#    → 关 Xet 不但不慢，反而快 ~2.3×。**这个决定不依赖任何外部解释。**
+#
+# ② 社区状况：**症状广泛复现，但机制无定论、零维护者确认**（别把任何一条当真理）：
+#    · xet-core#789  用户抓包 → "CDN 乱序投递 chunk、TCP 拥塞窗口冻结在 10"。**维护者零回应**。
+#    · hub#3580      "stalls at 99-100%"、304MB/s→75.5kB/s（**与我们 99.1% 精确吻合**）。**未定因**。
+#                    ⚠️ 该帖明说 `HF_XET_HIGH_PERFORMANCE=1` 和 `=0` **都会发生**，
+#                       也**串行/并行都会** → 反证"高并发才触发"这一说。
+#    · hub#4223      xet 416 CAS 错误、**exit 0 却留 .incomplete**（"退出码撒谎，只有文件系统是真相"）。
+#    三种归因互不相同，都没有官方确认 → **只当作"已知问题"，不当作已解释的问题**。
+#
+# ③ 关于我 8/18 的改动：曾把 HF_XET_NUM_CONCURRENT_RANGE_GETS 16→32 并加多文件并发。
+#    据 hub#3580（高性能开关都犯）看，**那大概率不是本次成因**；但当时"串行没吃满带宽"的诊断
+#    确实是错的——瓶颈不是串行，是 Xet 本身。故一并撤销，不再靠调 Xet 并发来提速。
 export HF_HUB_DISABLE_XET=1
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"   # 大分片建议加长，见 hub#3580
 unset HF_XET_HIGH_PERFORMANCE HF_XET_NUM_CONCURRENT_RANGE_GETS 2>/dev/null || true
