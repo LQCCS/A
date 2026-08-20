@@ -75,6 +75,11 @@ HF_DIR="$(dirname "$HF_BIN")"
 # - HF_XET_HIGH_PERFORMANCE 对 Xet 后端仓库(H3 即是)加速，缺包时被忽略、无害。
 # - HF_HUB_ENABLE_HF_TRANSFER 只在确认 hf_transfer 可 import 时才开，否则 hf 会因缺包直接报错、拖垮下载。
 "$HF_DIR/pip" install -q -U hf_transfer hf_xet >/dev/null 2>&1 || pip install -q -U hf_transfer hf_xet >/dev/null 2>&1 || true
+# aria2c：给 download_one 用的多连接下载器（见那里的依据）。装不上不影响——会回落 curl。
+# `|| true` 兜底：开机时 apt 锁被占/源不通都不该拖垮 provisioning。
+command -v aria2c >/dev/null 2>&1 || \
+  (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 >/dev/null 2>&1) || true
+command -v aria2c >/dev/null 2>&1 && log "下载器: aria2c 可用（大文件走 -x16 多连接）" || log "下载器: 无 aria2c，大文件走单流 curl"
 
 # ══ 🔴 关掉 Xet，超大文件改走可续传直连（2026-08-19）══════════════════════════
 # ① 决定的依据 = **本地实测**（这一条最硬，与下面的机制假说无关）：
@@ -153,6 +158,31 @@ download_one() {
 
   while [ $attempt -le $max ]; do
     part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+    # ── 优先 aria2c 多连接（-x16）──────────────────────────────────────────────
+    # 依据：HF 的 CDN **按连接限速**，单流吃不满链路——官方 huggingface-cli 实测只用到
+    # 带宽的 10~20%（padeoe/hfd gist、多篇独立实测一致）；aria2c 的 max-connection-per-server
+    # 上限就是 16，故 -x16 -s16 是社区事实标准写法。对 TE(51.5G)/bf16 DiT(66.3G) 这种
+    # 单个超大文件收益最大——它们本来就是整条装机链路上最慢的一段。
+    # ⚠️ 不装/不可用一律回落到下面的 curl（原路径原样保留，续传语义一致：都靠 .partial 的现有字节数）。
+    if command -v aria2c >/dev/null 2>&1; then
+      log "aria2c 多连接下载 $f (第 $attempt/$max 次，-x16 续传 $part_got/$expected)..."
+      if timeout 3600 aria2c --continue=true --max-connection-per-server=16 --split=16 \
+          --min-split-size=8M --max-tries=1 --timeout=30 --connect-timeout=30 \
+          --lowest-speed-limit=1M --allow-overwrite=false --auto-file-renaming=false \
+          --summary-interval=0 --console-log-level=warn \
+          --dir "$(dirname "$part")" --out "$(basename "$part")" "$url" 2>&1 | tail -3 | tee -a "$LOG"; then
+        got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+        if [ "$got" = "$expected" ]; then
+          rm -f "${part}.aria2"
+          mv "$part" "$dest"
+          log "✓ $f ($got B, aria2c)"
+          return 0
+        fi
+      fi
+      got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+      log "aria2c 未完整 ($got/$expected)，本轮转 curl 兜底…"
+      rm -f "${part}.aria2"          # 留着会让 curl 的 -C - offset 与控制文件对不上
+    fi
     log "直连下载 $f (第 $attempt/$max 次，续传 $part_got/$expected)..."
     # Keep retries outside curl: before every attempt we re-read .partial's
     # current size.  curl's internal retry can reuse a stale -C offset and
