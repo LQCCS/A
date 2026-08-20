@@ -54,6 +54,15 @@ h3_file_complete() {
   [ "$got" = "$expected" ]
 }
 
+# 🔴 huggingface_hub 的普通下载路径**硬拒 >50GB 的单文件**（Xet 已被我们关掉，见下）。
+# 2026-08-20 实测（实例 48185148）：把 TE(51.5G) 一起交给 `hf download` 并行批次 →
+#   `Fetching 4 files: 25%|██▌ | 1/4 [07:22]` 后抛
+#   `Error: Invalid value. The file is too large to be downloaded using the regular download method.`
+#   → **整批中断**，只完成 1/4，剩下的全退化成逐个串行 curl，白白丢掉并行。
+# ⚠️ 报错里劝你 `pip install hf_xet` —— **别听**：Xet 正是我们实测卡死在 99.1% 的东西（见下方 ①）。
+# 正解 = 按大小分流：>HF_MAX_BYTES 的直接走可续传 curl（且彼此并行），≤ 的才交给 hf 并行批次。
+HF_MAX_BYTES="${HF_MAX_BYTES:-50000000000}"   # 50 GB（十进制）。当前只有 TE 51.5G / bf16 DiT 66.3G 超线。
+
 # hf CLI：vast 把它装在 provisioner venv，系统 PATH 里未必有
 if ! command -v hf >/dev/null 2>&1; then
   export PATH="/opt/instance-tools/provisioner/venv/bin:/venv/main/bin:$PATH"
@@ -101,6 +110,9 @@ if "$HF_DIR/python" -c "import hf_transfer" >/dev/null 2>&1 || python -c "import
 else
   log "下载: **Xet 已禁用**(xet-core#789 拥塞崩溃)，普通 HTTPS，hub=${_HUBVER} timeout=${HF_HUB_DOWNLOAD_TIMEOUT}s"
 fi
+# 匿名拉 HF 会被限速（日志里那句 "You are sending unauthenticated requests to the HF Hub"）。
+# 仓库是公开的、没 token 也能下，只是慢 → 想提速就在 vast 模板 env 里加 -e HF_TOKEN=hf_xxx。
+[ -n "${HF_TOKEN:-}" ] || log "[WARN] 未设 HF_TOKEN：匿名下载会被限速（公开仓库仍可下）。模板加 -e HF_TOKEN=… 可提速"
 
 download_one() {
   local f="$1"
@@ -207,16 +219,27 @@ main() {
     log "[ERROR] 等待 H3 模型下载锁超时"; return 1
   fi
   log "已取得 H3 模型下载锁"
-  local missing=()
+  local missing=() small=() big=() pids=() sz p
   for f in "${H3_FILES[@]}"; do h3_file_complete "$f" || missing+=("$f"); done
-  if [ ${#missing[@]} -gt 0 ] && "$HF_BIN" download --help 2>&1 | grep -q -- "--max-workers"; then
-    log "并行拉 ${#missing[@]} 个文件（--max-workers ${H3_DL_WORKERS:-4}）"
-    "$HF_BIN" download "$HF_REPO" "${missing[@]}" --local-dir "$MODELS" \
-      --max-workers "${H3_DL_WORKERS:-4}" 2>&1 | tail -4 | tee -a "$LOG" || \
-      log "[WARN] 并行下载未全成，转逐个兜底"
-  elif [ ${#missing[@]} -gt 0 ]; then
-    log "hf CLI 无 --max-workers（旧版），走逐个串行"
+  # 🔴 按大小分流（2026-08-20 修）：>50GB 交给 hf 会让**整批**中断（见 HF_MAX_BYTES 处实测），
+  #    所以大文件直接走 download_one 的可续传 curl，且大/小两路**并行**跑，不再互相拖。
+  for f in "${missing[@]}"; do
+    sz="$(h3_expected_bytes "$f" 2>/dev/null || echo 0)"
+    if [ "$sz" -gt "$HF_MAX_BYTES" ]; then big+=("$f"); else small+=("$f"); fi
+  done
+  if [ ${#big[@]} -gt 0 ]; then
+    log "超 $((HF_MAX_BYTES/1000000000))GB 的 ${#big[@]} 个文件走 curl 直连（hf 会拒；彼此并行）：${big[*]}"
+    for f in "${big[@]}"; do download_one "$f" & pids+=("$!"); done
   fi
+  if [ ${#small[@]} -gt 0 ] && "$HF_BIN" download --help 2>&1 | grep -q -- "--max-workers"; then
+    log "并行拉 ${#small[@]} 个 ≤$((HF_MAX_BYTES/1000000000))GB 文件（--max-workers ${H3_DL_WORKERS:-4}）"
+    ( "$HF_BIN" download "$HF_REPO" "${small[@]}" --local-dir "$MODELS" \
+        --max-workers "${H3_DL_WORKERS:-4}" 2>&1 | tail -4 | tee -a "$LOG" || \
+        log "[WARN] hf 并行未全成，转逐个兜底" ) & pids+=("$!")
+  elif [ ${#small[@]} -gt 0 ]; then
+    log "hf CLI 无 --max-workers（旧版），这 ${#small[@]} 个交给下面逐个兜底"
+  fi
+  for p in "${pids[@]}"; do wait "$p" || true; done   # 大/小两路都收完再进兜底校验
   local failed=0
   for f in "${H3_FILES[@]}"; do
     h3_file_complete "$f" || download_one "$f" || failed=$((failed+1))
