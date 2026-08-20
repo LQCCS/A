@@ -159,10 +159,19 @@ download_one() {
   while [ $attempt -le $max ]; do
     part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
     # ── 优先 aria2c 多连接（-x16）──────────────────────────────────────────────
-    # 依据：HF 的 CDN **按连接限速**，单流吃不满链路——官方 huggingface-cli 实测只用到
-    # 带宽的 10~20%（padeoe/hfd gist、多篇独立实测一致）；aria2c 的 max-connection-per-server
-    # 上限就是 16，故 -x16 -s16 是社区事实标准写法。对 TE(51.5G)/bf16 DiT(66.3G) 这种
-    # 单个超大文件收益最大——它们本来就是整条装机链路上最慢的一段。
+    # ⚠️ **依据等级：机制推理⑤ + 一条官方口径②，没有当前时间线的对照实测**（2026-08-20 核过时间线）：
+    #   ✅ ② HF 员工 rajatarya（xet-core#592，2025-12，仍 open）原话：
+    #      "There is **no reliable way to serve files larger than 50GB over a single HTTP connection**"
+    #      → TE 51.5G / bf16 DiT 66.3G 正好压在这条线上面，多连接对**这两个文件**有官方口径支持。
+    #   ⚠️ ④ 到处被转述的"官方 CLI 只用到 10~20% 带宽"= bughoho/hfdownloader 的 README 自测，
+    #      那仓库 **2024-10-17 建、2024-10-18 停更、9 星**，测的是 **Xet 之前**的旧版 CLI。**别当实测引用。**
+    #      同理它那句"千兆跑满 100MB/s"是靠**自建 Cloudflare Worker 反代多服务器**拿到的，**不是 aria2 -x16**。
+    #   ⚠️ 反面也一样过期：padeoe/hfd gist 评论区有"aria2c 几乎下不动 / 末尾掉到<100k/s 卡住"的
+    #      真实用户报告，但都在 **2024-03 ~ 2025-02**，而 HF 这两年换掉了整条传输栈
+    #      （Xet 成默认、hub 1.0+ 移除 hf_transfer、2026-08 因攻击在 GCP 重建 CDN）。
+    #      该 gist 评论 **2025-09 后归零**，2026 年一条都没有。
+    #   → **正反证据全部产生于旧传输栈，都不作数。装它是因为"失败可回落、代价接近零"，不是因为已证明更快。**
+    #      真实收益必须用同机 A/B（curl 单流 vs aria2 -x16 各 60s，交替两轮）来定。
     # ⚠️ 不装/不可用一律回落到下面的 curl（原路径原样保留，续传语义一致：都靠 .partial 的现有字节数）。
     if command -v aria2c >/dev/null 2>&1; then
       log "aria2c 多连接下载 $f (第 $attempt/$max 次，-x16 续传 $part_got/$expected)..."
@@ -251,25 +260,37 @@ main() {
   log "已取得 H3 模型下载锁"
   local missing=() small=() big=() pids=() sz p
   for f in "${H3_FILES[@]}"; do h3_file_complete "$f" || missing+=("$f"); done
-  # 🔴 按大小分流（2026-08-20 修）：>50GB 交给 hf 会让**整批**中断（见 HF_MAX_BYTES 处实测），
-  #    所以大文件直接走 download_one 的可续传 curl，且大/小两路**并行**跑，不再互相拖。
-  for f in "${missing[@]}"; do
-    sz="$(h3_expected_bytes "$f" 2>/dev/null || echo 0)"
-    if [ "$sz" -gt "$HF_MAX_BYTES" ]; then big+=("$f"); else small+=("$f"); fi
-  done
-  if [ ${#big[@]} -gt 0 ]; then
-    log "超 $((HF_MAX_BYTES/1000000000))GB 的 ${#big[@]} 个文件走 curl 直连（hf 会拒；彼此并行）：${big[*]}"
-    for f in "${big[@]}"; do download_one "$f" & pids+=("$!"); done
+  # ══ 🔴 有 aria2c 就全部走 aria2c，整个跳过 hf 批次（2026-08-20 同机实测定案）══════════
+  # 实例 48189450（RTX PRO 6000 WS @ Czechia，链路 4771 Mbps = 596 MB/s）**同一台机、同一次装机**：
+  #   · aria2c -x16 拉 TE 51,506,295,256 B：07:57:46 → 07:59:33 = 107s → **481 MB/s（81% 链路）**
+  #     （数字取自本脚本自己的 log 时间戳 + 精确字节校验通过后才打的 ✓，不是 du 估的）
+  #   · 同一次装机里 hf download --max-workers 4 拉剩下 3 个文件：**27 MB/s（4.5% 链路）**
+  #   → **≈18×**。所以"只有 >50GB 才走 aria2"的阈值是反的，aria2c 在时 hf 批次没有存在价值。
+  # ⚠️ n=1、两段不在同一时间窗、aria2 那 107s 还在和 hf 抢带宽（单独跑只会更高）。
+  # 为什么**不**并发多个文件：单文件 -x16 已吃满 81% 链路，再叠并发只是多开连接、徒增被 CDN
+  #   限流的面（aria2 对 429 不重试，见 aria2#1421/#2295 至今 open）。交给下面的串行兜底循环即可。
+  if [ ${#missing[@]} -gt 0 ] && command -v aria2c >/dev/null 2>&1; then
+    log "aria2c 可用 → **${#missing[@]} 个文件全部走 aria2c -x16**（实测 481MB/s vs hf 27MB/s），跳过 hf 批次"
+  elif [ ${#missing[@]} -gt 0 ]; then
+    # 没有 aria2c 才退回"按大小分流"：>50GB 交给 hf 会让**整批**中断（见 HF_MAX_BYTES 处实测）
+    for f in "${missing[@]}"; do
+      sz="$(h3_expected_bytes "$f" 2>/dev/null || echo 0)"
+      if [ "$sz" -gt "$HF_MAX_BYTES" ]; then big+=("$f"); else small+=("$f"); fi
+    done
+    if [ ${#big[@]} -gt 0 ]; then
+      log "无 aria2c；超 $((HF_MAX_BYTES/1000000000))GB 的 ${#big[@]} 个走 curl 直连（hf 会拒）：${big[*]}"
+      for f in "${big[@]}"; do download_one "$f" & pids+=("$!"); done
+    fi
+    if [ ${#small[@]} -gt 0 ] && "$HF_BIN" download --help 2>&1 | grep -q -- "--max-workers"; then
+      log "无 aria2c；并行拉 ${#small[@]} 个 ≤$((HF_MAX_BYTES/1000000000))GB 文件（--max-workers ${H3_DL_WORKERS:-4}）"
+      ( "$HF_BIN" download "$HF_REPO" "${small[@]}" --local-dir "$MODELS" \
+          --max-workers "${H3_DL_WORKERS:-4}" 2>&1 | tail -4 | tee -a "$LOG" || \
+          log "[WARN] hf 并行未全成，转逐个兜底" ) & pids+=("$!")
+    elif [ ${#small[@]} -gt 0 ]; then
+      log "hf CLI 无 --max-workers（旧版），这 ${#small[@]} 个交给下面逐个兜底"
+    fi
   fi
-  if [ ${#small[@]} -gt 0 ] && "$HF_BIN" download --help 2>&1 | grep -q -- "--max-workers"; then
-    log "并行拉 ${#small[@]} 个 ≤$((HF_MAX_BYTES/1000000000))GB 文件（--max-workers ${H3_DL_WORKERS:-4}）"
-    ( "$HF_BIN" download "$HF_REPO" "${small[@]}" --local-dir "$MODELS" \
-        --max-workers "${H3_DL_WORKERS:-4}" 2>&1 | tail -4 | tee -a "$LOG" || \
-        log "[WARN] hf 并行未全成，转逐个兜底" ) & pids+=("$!")
-  elif [ ${#small[@]} -gt 0 ]; then
-    log "hf CLI 无 --max-workers（旧版），这 ${#small[@]} 个交给下面逐个兜底"
-  fi
-  for p in "${pids[@]}"; do wait "$p" || true; done   # 大/小两路都收完再进兜底校验
+  for p in "${pids[@]}"; do wait "$p" || true; done   # 两路都收完再进兜底校验
   local failed=0
   for f in "${H3_FILES[@]}"; do
     h3_file_complete "$f" || download_one "$f" || failed=$((failed+1))
