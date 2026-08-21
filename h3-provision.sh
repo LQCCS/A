@@ -175,20 +175,31 @@ download_one() {
     # ⚠️ 不装/不可用一律回落到下面的 curl（原路径原样保留，续传语义一致：都靠 .partial 的现有字节数）。
     if command -v aria2c >/dev/null 2>&1; then
       log "aria2c 多连接下载 $f (第 $attempt/$max 次，-x16 续传 $part_got/$expected)..."
-      if timeout 3600 aria2c --continue=true --max-connection-per-server=16 --split=16 \
+      # 🔴 `--summary-interval=20` 必须开（2026-08-20 踩，实例 48277770/48277679）：
+      #    aria2 **预分配整个文件**（实测下载中的 .partial：apparent 51,506,295,256 =完整大小，
+      #    blocks×512 = 51,506,302,976 也已全满）→ **`du -sb` 和 `du -sB1` 两个都从第一秒就是满的**，
+      #    租机脚本那边基于 du 的进度条因此要么报"约剩 0 分钟"(假完成)、要么报"速率≈0 停滞"(假挂死)。
+      #    → 唯一可信的进度来自 aria2 自己的 summary（`[#xxxx 12GiB/34GiB(35%) CN:16 DL:480MiB ETA:45s]`）。
+      #    输出链路：`tr \r \n` 把它的回车刷新拆成行 → 只留 summary/结果行 → **stdbuf 行缓冲的 tee**
+      #    同时写 $LOG 和 stdout；stdout 会被 vast 收进 /var/log/provisioning.log，
+      #    租机脚本 `tail -n 8` 那一步就能实时看见。**别再在后面接 `| tail -N`**——那会等到 EOF 才吐字。
+      # ⚠️ **不看管道退出码**：`grep` 没匹配到行会退出 1，配合 `set -o pipefail` 会把成功误判成失败。
+      #    判据只用**精确字节数**（本来就比退出码强）。
+      timeout 3600 aria2c --continue=true --max-connection-per-server=16 --split=16 \
           --min-split-size=8M --max-tries=1 --timeout=30 --connect-timeout=30 \
           --lowest-speed-limit=1M --allow-overwrite=false --auto-file-renaming=false \
-          --summary-interval=0 --console-log-level=warn \
-          --dir "$(dirname "$part")" --out "$(basename "$part")" "$url" 2>&1 | tail -3 | tee -a "$LOG"; then
-        got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
-        if [ "$got" = "$expected" ]; then
-          rm -f "${part}.aria2"
-          mv "$part" "$dest"
-          log "✓ $f ($got B, aria2c)"
-          return 0
-        fi
-      fi
+          --summary-interval=20 --console-log-level=warn \
+          --dir "$(dirname "$part")" --out "$(basename "$part")" "$url" 2>&1 \
+        | stdbuf -oL tr '\r' '\n' \
+        | stdbuf -oL grep -E '^\[#|\(OK\)|ERR|error' \
+        | stdbuf -oL tee -a "$LOG" || true
       got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
+      if [ "$got" = "$expected" ]; then
+        rm -f "${part}.aria2"
+        mv "$part" "$dest"
+        log "✓ $f ($got B, aria2c)"
+        return 0
+      fi
       log "aria2c 未完整 ($got/$expected)，本轮转 curl 兜底…"
       rm -f "${part}.aria2"          # 留着会让 curl 的 -C - offset 与控制文件对不上
     fi
