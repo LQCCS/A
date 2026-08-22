@@ -4,12 +4,14 @@
 #
 # 用法（在实例上直接跑，一把梭）：
 #   bash <(curl -sL https://raw.githubusercontent.com/LQCCS/A/main/h3-setup.sh)
-#   # 选 DiT / 关 Sage：
-#   H3_DIT_FILE=diffusion_models/minimax_h3_ref2va_bf16.safetensors NO_SAGE=1 bash <(curl -sL ...)
+#   # 默认 = bf16 全套 123.6G + SageAttention + Spectrum。切 int8 跑量 / 关加速：
+#   H3_DIT_FILE=diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors bash <(curl -sL ...)
+#   NO_SAGE=1 NO_SPECTRUM=1 bash <(curl -sL ...)
 #
 # 与 h3-provision.sh 的区别：那个是 vast 的 PROVISIONING_SCRIPT（开机自动跑、只管下模型）；
 # 这个是**手动跑的全套**，把原来散在 rent_h3_instance.py 里的"装节点/编译 Sage/校正启动参数/重启"
 # 一并收进来，不含选机/租机/冒烟出片/测速。已装的部分全部幂等秒过，可反复跑。
+#   —— 冒烟出片仍然**不在这里**：它归 rent_h3_instance.py 的步骤 7（那儿有参考图和计时逻辑）。
 #
 # 故意不用 set -e：单个模型失败不该中断整个装机（末尾统一汇总成败）。
 set -uo pipefail
@@ -32,8 +34,11 @@ FAILED=0
 step() { echo; log "══════ $1 ══════"; }
 
 # ── 模型清单（HF 精确字节数，下完只认精确匹配；下载中断留下的半截文件也非空，光看 -s 不够）──
-# DiT 由 H3_DIT_FILE 指定（逗号分隔 1~2 个），不设=int8_convrot。
-IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
+# DiT 由 H3_DIT_FILE 指定（逗号分隔 1~2 个）。
+# 默认改为 **bf16（66.3G，零损失原版精度）**：用户 2026-08-22 定"直接换成 bf16"，
+# 全套 = bf16 DiT 66.3G + bf16 TE 51.5G + VAE 5.8G = 123.6G，盘需 ≥180G。
+# 想回 int8 跑量：H3_DIT_FILE=diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors
+IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_bf16.safetensors}"
 H3_FILES=(
   "${_DITS[@]}"
   "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"   # bf16 TE ~51.5G
@@ -196,7 +201,7 @@ flock -u 9 || true
 # "near-identical"）。唯一需要源码编译的一步（~5-8min），已装则秒过。NO_SAGE=1 可跳过。
 # 🔴 cu130 机的坑：编译要 cusparse.h，它在 venv 里不在系统 include → 必须动态找出来塞进 CPATH，
 #    否则必炸。架构按本机 compute_cap 定（sm120/sm90 都适配），别写死。
-step "步骤 4 · KJNodes + SageAttention"
+step "步骤 4 · KJNodes + SageAttention + Spectrum"
 mkdir -p "$(dirname "$SAGE_LOG")"; : >> "$SAGE_LOG"
 cd "$CU/custom_nodes" || { log "[ERROR] 进不去 custom_nodes"; FAILED=$((FAILED+1)); }
 if [ -d ComfyUI-KJNodes ]; then
@@ -205,6 +210,34 @@ else
   log "clone KJNodes…"
   git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git >>"$SAGE_LOG" 2>&1 || true
   "$PIP" install -q -r ComfyUI-KJNodes/requirements.txt >>"$SAGE_LOG" 2>&1 || true
+fi
+
+# ── Spectrum：跳步预测加速（和 Sage 正交，可叠加）─────────────────────────────
+# 原理：用切比雪夫岭回归预测 transformer 输出，跳过部分真实评估。
+# 作者数据：20 步典型解成 11 次真实评估 + 9 次预测。
+# ⚠️ 它是**近似**加速器——README 原话 "output can differ from native H3 even with the
+#    same seed"。所以只**装**、不自动接进工作流；要用就在 UI 里把
+#    `Spectrum Apply MiniMax H3` 插在 SigmaShift 和 guider 之间。追求零损失就别接。
+# ⚠️ 别和 EasyCache/LazyCache 放同一条 model 分支（README:325，Spectrum 会检测到并静默失效）。
+# ✅ 不改 attention 后端（README:318），和上面编译的 SageAttention 2.x 可同时开。
+# ✅ pyproject dependencies = []，零 pip 依赖，clone 完就能用。
+# 版本硬要求核过：它只要 comfy.ldm.minimax.model 有 PackedLayout/unpatchify_video/
+#   unpack_audio/time_shift_sigma 四个 helper，v0.30.0 全有（README 那句 "minimum
+#   reviewed commit e377e263" 只是作者测试基线：该 commit 与 v0.30.0 之间仅 2 个提交，
+#   只动了 model_management.py 和 requirements.txt，H3 模型文件 blob sha 完全相同）。
+if [ -n "${NO_SPECTRUM:-}" ]; then
+  log "NO_SPECTRUM=1 → 跳过 Spectrum"
+elif [ -d ComfyUI-Spectrum-MiniMax-H3/.git ]; then
+  log "Spectrum 已存在（$(git -C ComfyUI-Spectrum-MiniMax-H3 rev-parse --short HEAD 2>/dev/null || echo '?')）"
+else
+  log "clone Spectrum…"
+  git clone --depth 1 https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3.git >>"$SAGE_LOG" 2>&1 || true
+  if [ -d ComfyUI-Spectrum-MiniMax-H3 ]; then
+    # clone 不钉 commit = 供应链漂移；这个 sha 是出问题时唯一的复现锚点，无条件记进日志
+    log "✓ Spectrum $(git -C ComfyUI-Spectrum-MiniMax-H3 rev-parse --short HEAD 2>/dev/null || echo '?')"
+  else
+    log "[WARN] Spectrum clone 失败（不致命，只是没有跳步加速）"
+  fi
 fi
 if [ -n "${NO_SAGE:-}" ]; then
   log "NO_SAGE=1 → 跳过 SageAttention（回落 SDPA，约慢 1.5-2×）"
@@ -265,6 +298,28 @@ for f in "${H3_FILES[@]}"; do
   if [ "$got" = "$exp" ]; then log "  OK   $f ($got B)"
   else log "  BAD  $f ($got/$exp)"; FAILED=$((FAILED+1)); fi
 done
+# 加速件是软失败项：没装上不判整机不合格，但必须看得见（否则"怎么没变快"无从查起）
+# ⚠️ /object_info/<名> 对不存在的节点也返回 200 → 只能查 JSON body 里有没有那个 key
+if curl -sf --max-time 15 http://127.0.0.1:18188/object_info/SpectrumApplyMiniMaxH3 2>/dev/null \
+     | grep -q SpectrumApplyMiniMaxH3; then
+  log "  OK   Spectrum 节点已注册（用不用由工作流决定）"
+else
+  log "  --   Spectrum 节点未注册（NO_SPECTRUM=1 或 clone 失败；不影响出片）"
+fi
+"$PY" -c "import sageattention" 2>/dev/null \
+  && log "  OK   sageattention import 正常" \
+  || log "  --   sageattention 不可用 → 回落 SDPA（约慢 1.5-2×）"
+# bf16 的命门：这个 flag 在 = 长片必 OOM。步骤 5 改的是 $ENV_FILE，这里查**真实生效**的命令行。
+# ⚠️ 必须把"读不到命令行"和"读到了且干净"分开报：合在一起写会让 supervisorctl 失败时
+#    grep 无匹配 → 走 else → 打出 "OK DynamicVRAM 开着"，这是**假通过**。
+_pid="$(supervisorctl pid comfyui 2>/dev/null | tr -dc '0-9')"
+if [ -z "$_pid" ] || [ ! -r "/proc/$_pid/cmdline" ]; then
+  log "  ??   读不到 comfyui 命令行（pid='${_pid:-空}'）—— DynamicVRAM 状态未知，别当通过"
+elif tr '\0' ' ' < "/proc/$_pid/cmdline" | grep -q -- '--disable-dynamic-vram'; then
+  log "  BAD  --disable-dynamic-vram 仍在生效命令行里 —— bf16 长片会 OOM"; FAILED=$((FAILED+1))
+else
+  log "  OK   DynamicVRAM 开着（已核实生效命令行，无 --disable-dynamic-vram）"
+fi
 echo
 if [ "$FAILED" -eq 0 ]; then
   log "═══ ✓ 装机完成，模型齐全、服务已起 ═══"

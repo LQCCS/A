@@ -37,7 +37,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "${url##*/}" in
-  minimax_h3_ref2va_int8_convrot.safetensors) size=103 ;;
+  # 所有 DiT 档位都给 103：本测试跑脚本的当前默认 DiT，默认改了也不用动这里
+  minimax_h3_ref2va_*.safetensors) size=103 ;;
   qwen3vl_32b_minimax_h3_bf16.safetensors) size=101 ;;
   minimax_h3_video_vae_fp16.safetensors) size=102 ;;
   minimax_h3_audio_vae_fp32.safetensors) size=100 ;;
@@ -61,6 +62,16 @@ if [ "$got" -eq 0 ]; then
 fi
 head -c "$((size - got))" /dev/zero >> "$out"
 echo "stub-http-206 ${url##*/} bytes=$size"
+STUB
+
+# aria2c 桩：**必须有**，否则测试结果取决于宿主装没装 aria2——
+# 宿主有真 aria2c 时脚本会走 aria2 分支去真连 HF（慢、要网、非确定）。
+# 这里让它"存在但下不动"，从而确定性地逼出本测试要验的 curl 续传兜底路径。
+cat > "$ROOT/stub/aria2c" <<'STUB'
+#!/bin/bash
+[ "${1:-}" = "--version" ] && { echo "aria2 version 1.stub"; exit 0; }
+echo 'stub-aria2c-refuses' >&2
+exit 1
 STUB
 
 cat > "$ROOT/stub/flock" <<'STUB'
@@ -99,12 +110,28 @@ STUB
 chmod +x "$ROOT/stub"/*
 
 # 用手工核对的小字节 fixture 替换真实模型大小；下载控制流保持原样。
+# ⚠️ **所有 DiT 档位都要打桩、且都打成同一个 103**：本测试不设 H3_DIT_FILE，
+#    故意跑脚本的**当前默认 DiT**（那才是真正会发货的路径）。默认值一改
+#    （如 2026-08-22 int8→bf16），只给单一档位打桩会让测试假失败。
+#    全部打成同一个尺寸，下面的断言就不用关心默认到底是哪一档。
 sed \
   -e 's/34038894550/103/g' \
+  -e 's/66280487368/103/g' \
+  -e 's/40225724176/103/g' \
+  -e 's/20970379616/103/g' \
+  -e 's/20958205608/103/g' \
   -e 's/51506295256/101/g' \
   -e 's/5207808496/102/g' \
   -e 's/605254808/100/g' \
   "$SOURCE_SCRIPT" > "$ROOT/provision-under-test.sh"
+
+# 从被测脚本里解析出默认 DiT —— 断言跟着它走，而不是写死某个文件名
+DEFAULT_DIT="$(sed -n 's/.*H3_DIT_FILE:-\([^}]*\)}.*/\1/p' "$SOURCE_SCRIPT" | head -1)"
+if [ -z "$DEFAULT_DIT" ]; then
+  echo "FAIL: 解析不出默认 H3_DIT_FILE（脚本结构变了？）"
+  exit 1
+fi
+echo "被测默认 DiT: $DEFAULT_DIT"
 
 export PATH="$ROOT/stub:$PATH"
 export WORKSPACE="$ROOT"
@@ -122,7 +149,7 @@ if [ "$status" -ne 0 ]; then
 fi
 
 for spec in \
-  'diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors:103' \
+  "$DEFAULT_DIT:103" \
   'text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors:101' \
   'vae/minimax_h3_video_vae_fp16.safetensors:102' \
   'vae/minimax_h3_audio_vae_fp32.safetensors:100'

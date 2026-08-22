@@ -20,9 +20,12 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
 # 公开仓库，不需要 HF_TOKEN；如模板里设了 HF_TOKEN 会自动用（解除匿名限速、下得更快）。
 HF_REPO="Comfy-Org/MiniMax-H3"
 # DiT 由 rent 脚本/模板的 -e H3_DIT_FILE 指定（**逗号分隔 1~2 个**，2 个用于同机对照实验）；
-# 不设=默认 int8_convrot（保手动起机不受影响）。⚠️ rent 脚本租后还会 SSH 强制校正一次，这里只是快路径。
-# 可选: ref2va_int8_convrot(34G) / bf16(66G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
-IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
+# 不设=默认 **bf16**（用户 2026-08-22 定"直接换成 bf16"，最大保真）。
+# ⚠️ 盘要求随之变了：bf16 全套 = DiT 66.3G + TE 51.5G + VAE 5.8G = 123.6G → **盘 ≥180G**
+#    （int8 那套只要 92G/150G 盘）。模板/rent 脚本的默认盘别忘了跟着调。
+# ⚠️ rent 脚本租后还会 SSH 跑 h3-setup.sh 校正一次，这里只是开机快路径。
+# 可选: ref2va_bf16(66G) / int8_convrot(34G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
+IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_bf16.safetensors}"
 H3_FILES=(
   "${_DITS[@]}"                                                    # 选中的 DiT（1~2 个，逗号分隔）
   "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"         # bf16 TE ~51.5G
