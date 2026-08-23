@@ -25,6 +25,8 @@ PIP="$VENV/bin/pip"
 LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 SAGE_LOG="${SAGE_LOG:-/var/log/portal/sageattention-build.log}"
 ENV_FILE="${ENV_FILE:-/etc/environment}"   # 可覆盖，便于打桩测试（正常别动）
+PROC_DIR="${PROC_DIR:-/proc}"              # 同上：步骤 7 靠 $PROC_DIR/<pid>/cmdline 核实生效参数
+API_BASE="${API_BASE:-http://127.0.0.1:18188}"   # 同上：步骤 6/7 探活与节点查询
 COMFY_VERSION="${COMFY_VERSION:-v0.30.0}"
 HF_REPO="Comfy-Org/MiniMax-H3"
 mkdir -p "$(dirname "$LOG")"
@@ -283,7 +285,7 @@ log "现在是: $after"
 step "步骤 6 · 重启 ComfyUI 并等 18188"
 supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
 for i in $(seq 1 60); do
-  if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:18188/system_stats 2>/dev/null; then
+  if curl -sf -o /dev/null --max-time 3 "$API_BASE/system_stats" 2>/dev/null; then
     log "✓ ComfyUI 已起（18188 就绪，用了 ${i}0s 以内）"; break
   fi
   [ "$i" = 60 ] && { log "[ERROR] 18188 十分钟没起来 —— 看 $LOG"; FAILED=$((FAILED+1)); }
@@ -300,7 +302,7 @@ for f in "${H3_FILES[@]}"; do
 done
 # 加速件是软失败项：没装上不判整机不合格，但必须看得见（否则"怎么没变快"无从查起）
 # ⚠️ /object_info/<名> 对不存在的节点也返回 200 → 只能查 JSON body 里有没有那个 key
-if curl -sf --max-time 15 http://127.0.0.1:18188/object_info/SpectrumApplyMiniMaxH3 2>/dev/null \
+if curl -sf --max-time 15 "$API_BASE/object_info/SpectrumApplyMiniMaxH3" 2>/dev/null \
      | grep -q SpectrumApplyMiniMaxH3; then
   log "  OK   Spectrum 节点已注册（用不用由工作流决定）"
 else
@@ -313,9 +315,9 @@ fi
 # ⚠️ 必须把"读不到命令行"和"读到了且干净"分开报：合在一起写会让 supervisorctl 失败时
 #    grep 无匹配 → 走 else → 打出 "OK DynamicVRAM 开着"，这是**假通过**。
 _pid="$(supervisorctl pid comfyui 2>/dev/null | tr -dc '0-9')"
-if [ -z "$_pid" ] || [ ! -r "/proc/$_pid/cmdline" ]; then
+if [ -z "$_pid" ] || [ ! -r "$PROC_DIR/$_pid/cmdline" ]; then
   log "  ??   读不到 comfyui 命令行（pid='${_pid:-空}'）—— DynamicVRAM 状态未知，别当通过"
-elif tr '\0' ' ' < "/proc/$_pid/cmdline" | grep -q -- '--disable-dynamic-vram'; then
+elif tr '\0' ' ' < "$PROC_DIR/$_pid/cmdline" | grep -q -- '--disable-dynamic-vram'; then
   log "  BAD  --disable-dynamic-vram 仍在生效命令行里 —— bf16 长片会 OOM"; FAILED=$((FAILED+1))
 else
   log "  OK   DynamicVRAM 开着（已核实生效命令行，无 --disable-dynamic-vram）"
