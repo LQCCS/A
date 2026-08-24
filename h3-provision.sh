@@ -20,12 +20,9 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
 # 公开仓库，不需要 HF_TOKEN；如模板里设了 HF_TOKEN 会自动用（解除匿名限速、下得更快）。
 HF_REPO="Comfy-Org/MiniMax-H3"
 # DiT 由 rent 脚本/模板的 -e H3_DIT_FILE 指定（**逗号分隔 1~2 个**，2 个用于同机对照实验）；
-# 不设=默认 **bf16**（用户 2026-08-22 定"直接换成 bf16"，最大保真）。
-# ⚠️ 盘要求随之变了：bf16 全套 = DiT 66.3G + TE 51.5G + VAE 5.8G = 123.6G → **盘 ≥180G**
-#    （int8 那套只要 92G/150G 盘）。模板/rent 脚本的默认盘别忘了跟着调。
-# ⚠️ rent 脚本租后还会 SSH 跑 h3-setup.sh 校正一次，这里只是开机快路径。
-# 可选: ref2va_bf16(66G) / int8_convrot(34G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
-IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_bf16.safetensors}"
+# 不设=默认 int8_convrot（保手动起机不受影响）。⚠️ rent 脚本租后还会 SSH 强制校正一次，这里只是快路径。
+# 可选: ref2va_int8_convrot(34G) / bf16(66G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
+IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
 H3_FILES=(
   "${_DITS[@]}"                                                    # 选中的 DiT（1~2 个，逗号分隔）
   "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"         # bf16 TE ~51.5G
@@ -48,11 +45,22 @@ h3_expected_bytes() {
   esac
 }
 
+# 🔴 完整性判据 = 精确字节数 **且** 没有 aria2 控制文件 / .partial 兄弟文件。
+#    **只看字节数会被 prealloc 骗过** —— 本文件 188 行附近的注释早就记下了
+#    "aria2 预分配整个文件、du 从第一秒就是满的"，但当时没把这个事实接到判据上。
+#    2026-08-21 实测代价（实例 48277679）：一个被打断的 aria2 下载留下的文件
+#    `stat -c %s` = 66280487368（与期望值一字节不差），只有 80% 真数据；
+#    ComfyUI 照常加载 → 采样出 NaN → SaveVideo 报
+#    `avcodec_send_frame() returned 22 ... [aac] Input contains (near) NaN/+-Inf`。
+#    aria2 **只在成功完成时**自己删控制文件，所以它在 = 没下完。
 h3_file_complete() {
   local f="$1"
   local expected got
   expected="$(h3_expected_bytes "$f")" || return 1
   [ -f "$MODELS/$f" ] || return 1
+  [ -f "$MODELS/$f.aria2" ] && return 1          # 直接写最终名的未完成下载
+  [ -f "$MODELS/$f.partial.aria2" ] && return 1  # 走 .partial 的未完成下载
+  [ -f "$MODELS/$f.partial" ] && return 1        # 还有残留分片
   got="$(stat -c %s "$MODELS/$f" 2>/dev/null || echo 0)"
   [ "$got" = "$expected" ]
 }
@@ -136,6 +144,16 @@ download_one() {
   if h3_file_complete "$f"; then log "已存在且字节数正确，跳过: $f"; return 0; fi
   mkdir -p "$(dirname "$dest")"
 
+  # 🔴 最终文件旁若有 .aria2 控制文件 → 它是一次**直接写最终文件名**的未完成下载
+  #    （手工跑 `aria2c -o <最终名>` 会造成这个）。此时 stat 拿到的是 prealloc 的满尺寸，
+  #    会让下面的"字节数异常且不可续传"分支直接判死。先降级成 .partial 让它能续传/重下。
+  if [ -f "${dest}.aria2" ]; then
+    log "检测到最终文件旁有 aria2 控制文件（未完成的直写下载），降级为 .partial: $f"
+    rm -f "$part" "${part}.aria2"
+    mv -f "$dest" "$part" 2>/dev/null || true
+    mv -f "${dest}.aria2" "${part}.aria2" 2>/dev/null || true
+  fi
+
   # 若最终路径上是可续传的短文件，先退回 .partial；超大/未知文件不覆盖，避免误伤。
   if [ -f "$dest" ]; then
     got="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
@@ -188,7 +206,10 @@ download_one() {
       #    租机脚本 `tail -n 8` 那一步就能实时看见。**别再在后面接 `| tail -N`**——那会等到 EOF 才吐字。
       # ⚠️ **不看管道退出码**：`grep` 没匹配到行会退出 1，配合 `set -o pipefail` 会把成功误判成失败。
       #    判据只用**精确字节数**（本来就比退出码强）。
+      # 🔴 --file-allocation=none：别再让 aria2 预分配。开着 prealloc 时
+      #    "文件大小"从第一秒就等于最终大小，进度、续传偏移、完整性判据全部失去意义。
       timeout 3600 aria2c --continue=true --max-connection-per-server=16 --split=16 \
+          --file-allocation=none \
           --min-split-size=8M --max-tries=1 --timeout=30 --connect-timeout=30 \
           --lowest-speed-limit=1M --allow-overwrite=false --auto-file-renaming=false \
           --summary-interval=20 --console-log-level=warn \
@@ -197,14 +218,23 @@ download_one() {
         | stdbuf -oL grep -E '^\[#|\(OK\)|ERR|error' \
         | stdbuf -oL tee -a "$LOG" || true
       got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
-      if [ "$got" = "$expected" ]; then
-        rm -f "${part}.aria2"
+      # 🔴 判据两条都要：字节数匹配 **且** 控制文件已被 aria2 自己删掉（= 真的下完了）。
+      #    别把 `rm -f .aria2` 放到判断之前——那是先毁证据再判断。
+      if [ "$got" = "$expected" ] && [ ! -f "${part}.aria2" ]; then
         mv "$part" "$dest"
         log "✓ $f ($got B, aria2c)"
         return 0
       fi
-      log "aria2c 未完整 ($got/$expected)，本轮转 curl 兜底…"
-      rm -f "${part}.aria2"          # 留着会让 curl 的 -C - offset 与控制文件对不上
+      # 🔴 aria2 没下完 → **.partial 必须丢弃，不能交给 curl 续传**。
+      #    原注释说"留着控制文件会让 curl 的 -C - offset 对不上"——方向反了：
+      #    真正的问题是 aria2 用 -x16 **分段写**，文件大小 = 已写入的最高偏移，
+      #    中间可能全是空洞；叠加 prealloc 更是开局就满尺寸。
+      #    curl --continue-at - 只认"文件当前大小" → 从末尾续 → 下载 0 字节 →
+      #    下面的 `[ "$got" = "$expected" ]` 通过 → 装上一个几乎全空的文件。
+      #    没有控制文件就无从得知真实已下载区间，唯一安全做法是重下。
+      log "aria2c 未完整 ($got/$expected)，丢弃分片、转 curl 从 0 重下…"
+      rm -f "${part}.aria2" "$part"
+      part_got=0
     fi
     log "直连下载 $f (第 $attempt/$max 次，续传 $part_got/$expected)..."
     # Keep retries outside curl: before every attempt we re-read .partial's
