@@ -4,14 +4,12 @@
 #
 # 用法（在实例上直接跑，一把梭）：
 #   bash <(curl -sL https://raw.githubusercontent.com/LQCCS/A/main/h3-setup.sh)
-#   # 默认 = bf16 全套 123.6G + SageAttention + Spectrum。切 int8 跑量 / 关加速：
-#   H3_DIT_FILE=diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors bash <(curl -sL ...)
-#   NO_SAGE=1 NO_SPECTRUM=1 bash <(curl -sL ...)
+#   # 选 DiT / 关 Sage：
+#   H3_DIT_FILE=diffusion_models/minimax_h3_ref2va_bf16.safetensors NO_SAGE=1 bash <(curl -sL ...)
 #
 # 与 h3-provision.sh 的区别：那个是 vast 的 PROVISIONING_SCRIPT（开机自动跑、只管下模型）；
 # 这个是**手动跑的全套**，把原来散在 rent_h3_instance.py 里的"装节点/编译 Sage/校正启动参数/重启"
 # 一并收进来，不含选机/租机/冒烟出片/测速。已装的部分全部幂等秒过，可反复跑。
-#   —— 冒烟出片仍然**不在这里**：它归 rent_h3_instance.py 的步骤 7（那儿有参考图和计时逻辑）。
 #
 # 故意不用 set -e：单个模型失败不该中断整个装机（末尾统一汇总成败）。
 set -uo pipefail
@@ -25,8 +23,6 @@ PIP="$VENV/bin/pip"
 LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 SAGE_LOG="${SAGE_LOG:-/var/log/portal/sageattention-build.log}"
 ENV_FILE="${ENV_FILE:-/etc/environment}"   # 可覆盖，便于打桩测试（正常别动）
-PROC_DIR="${PROC_DIR:-/proc}"              # 同上：步骤 7 靠 $PROC_DIR/<pid>/cmdline 核实生效参数
-API_BASE="${API_BASE:-http://127.0.0.1:18188}"   # 同上：步骤 6/7 探活与节点查询
 COMFY_VERSION="${COMFY_VERSION:-v0.30.0}"
 HF_REPO="Comfy-Org/MiniMax-H3"
 mkdir -p "$(dirname "$LOG")"
@@ -36,11 +32,8 @@ FAILED=0
 step() { echo; log "══════ $1 ══════"; }
 
 # ── 模型清单（HF 精确字节数，下完只认精确匹配；下载中断留下的半截文件也非空，光看 -s 不够）──
-# DiT 由 H3_DIT_FILE 指定（逗号分隔 1~2 个）。
-# 默认改为 **bf16（66.3G，零损失原版精度）**：用户 2026-08-22 定"直接换成 bf16"，
-# 全套 = bf16 DiT 66.3G + bf16 TE 51.5G + VAE 5.8G = 123.6G，盘需 ≥180G。
-# 想回 int8 跑量：H3_DIT_FILE=diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors
-IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_bf16.safetensors}"
+# DiT 由 H3_DIT_FILE 指定（逗号分隔 1~2 个），不设=int8_convrot。
+IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
 H3_FILES=(
   "${_DITS[@]}"
   "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors"   # bf16 TE ~51.5G
@@ -60,10 +53,17 @@ expected_bytes() {
     *) return 1 ;;
   esac
 }
+# 🔴 完整性判据 = 精确字节数 **且** 无 aria2 控制文件 / .partial 残留。
+#    只看字节数会被 aria2 的 prealloc 骗过（2026-08-21 实测 48277679：
+#    stat 得到的字节数与期望值一字节不差，实际只有 80% 真数据 → ComfyUI 采样出 NaN）。
+#    aria2 只在真正下完时才自删控制文件，所以它在 = 没下完。
 file_complete() {
   local f="$1" expected got
   expected="$(expected_bytes "$f")" || return 1
   [ -f "$MODELS/$f" ] || return 1
+  [ -f "$MODELS/$f.aria2" ] && return 1
+  [ -f "$MODELS/$f.partial.aria2" ] && return 1
+  [ -f "$MODELS/$f.partial" ] && return 1
   got="$(stat -c %s "$MODELS/$f" 2>/dev/null || echo 0)"
   [ "$got" = "$expected" ]
 }
@@ -124,7 +124,10 @@ download_one() {
       #    唯一可信的是它自己的 `[#xxxx 12GiB/34GiB(35%) CN:16 DL:480MiB ETA:45s]`。
       #    tr \r \n 把回车刷新拆成行 + stdbuf 行缓冲 → 实时可见。**别接 `| tail -N`**（要等 EOF）。
       #    **也别看管道退出码**：grep 无匹配会退 1，配合 pipefail 把成功误判成失败 → 只认字节数。
+      # 🔴 --file-allocation=none：prealloc 会让"文件大小"从第一秒就等于最终大小，
+      #    进度、续传偏移、完整性判据全部失去意义。
       timeout 3600 aria2c --continue=true --max-connection-per-server=16 --split=16 \
+          --file-allocation=none \
           --min-split-size=8M --max-tries=1 --timeout=30 --connect-timeout=30 \
           --lowest-speed-limit=1M --allow-overwrite=false --auto-file-renaming=false \
           --summary-interval=20 --console-log-level=warn \
@@ -133,11 +136,19 @@ download_one() {
         | stdbuf -oL grep -E '^\[#|\(OK\)|ERR|error' \
         | stdbuf -oL tee -a "$LOG" || true
       got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
-      if [ "$got" = "$expected" ]; then
-        rm -f "$part.aria2"; mv "$part" "$dest"; log "✓ $f ($got B, aria2c)"; return 0
+      # 🔴 判据两条都要：字节数匹配 **且** aria2 已自删控制文件（只在真下完时才删）。
+      #    2026-08-21 实测代价（48277679）：被打断的下载 stat 得到 66280487368
+      #    （= 期望值一字节不差）却只有 80% 真数据 → ComfyUI 采样出 NaN →
+      #    `avcodec_send_frame() returned 22 ... [aac] Input contains (near) NaN/+-Inf`。
+      if [ "$got" = "$expected" ] && [ ! -f "$part.aria2" ]; then
+        mv "$part" "$dest"; log "✓ $f ($got B, aria2c)"; return 0
       fi
-      rm -f "$part.aria2"      # 留着会让 curl 的 -C - offset 与控制文件对不上
-      log "aria2c 未完整 ($got/$expected)，本轮转 curl 兜底…"
+      # 🔴 aria2 未完成 → .partial 必须丢弃。原注释方向反了：问题不在控制文件，
+      #    而在 aria2 -x16 **分段写**（大小 = 最高写入偏移，中间可能是空洞）。
+      #    curl --continue-at - 只认文件当前大小 → 从末尾续 → 下 0 字节 →
+      #    下面的大小检查通过 → 装上空壳。
+      rm -f "$part.aria2" "$part"
+      log "aria2c 未完整 ($got/$expected)，丢弃分片、转 curl 从 0 重下…"
     fi
     part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
     log "curl 直连下载 $f（第 $attempt/$max 次，续传 $part_got/$expected）"
@@ -203,7 +214,7 @@ flock -u 9 || true
 # "near-identical"）。唯一需要源码编译的一步（~5-8min），已装则秒过。NO_SAGE=1 可跳过。
 # 🔴 cu130 机的坑：编译要 cusparse.h，它在 venv 里不在系统 include → 必须动态找出来塞进 CPATH，
 #    否则必炸。架构按本机 compute_cap 定（sm120/sm90 都适配），别写死。
-step "步骤 4 · KJNodes + SageAttention + Spectrum"
+step "步骤 4 · KJNodes + SageAttention"
 mkdir -p "$(dirname "$SAGE_LOG")"; : >> "$SAGE_LOG"
 cd "$CU/custom_nodes" || { log "[ERROR] 进不去 custom_nodes"; FAILED=$((FAILED+1)); }
 if [ -d ComfyUI-KJNodes ]; then
@@ -212,34 +223,6 @@ else
   log "clone KJNodes…"
   git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git >>"$SAGE_LOG" 2>&1 || true
   "$PIP" install -q -r ComfyUI-KJNodes/requirements.txt >>"$SAGE_LOG" 2>&1 || true
-fi
-
-# ── Spectrum：跳步预测加速（和 Sage 正交，可叠加）─────────────────────────────
-# 原理：用切比雪夫岭回归预测 transformer 输出，跳过部分真实评估。
-# 作者数据：20 步典型解成 11 次真实评估 + 9 次预测。
-# ⚠️ 它是**近似**加速器——README 原话 "output can differ from native H3 even with the
-#    same seed"。所以只**装**、不自动接进工作流；要用就在 UI 里把
-#    `Spectrum Apply MiniMax H3` 插在 SigmaShift 和 guider 之间。追求零损失就别接。
-# ⚠️ 别和 EasyCache/LazyCache 放同一条 model 分支（README:325，Spectrum 会检测到并静默失效）。
-# ✅ 不改 attention 后端（README:318），和上面编译的 SageAttention 2.x 可同时开。
-# ✅ pyproject dependencies = []，零 pip 依赖，clone 完就能用。
-# 版本硬要求核过：它只要 comfy.ldm.minimax.model 有 PackedLayout/unpatchify_video/
-#   unpack_audio/time_shift_sigma 四个 helper，v0.30.0 全有（README 那句 "minimum
-#   reviewed commit e377e263" 只是作者测试基线：该 commit 与 v0.30.0 之间仅 2 个提交，
-#   只动了 model_management.py 和 requirements.txt，H3 模型文件 blob sha 完全相同）。
-if [ -n "${NO_SPECTRUM:-}" ]; then
-  log "NO_SPECTRUM=1 → 跳过 Spectrum"
-elif [ -d ComfyUI-Spectrum-MiniMax-H3/.git ]; then
-  log "Spectrum 已存在（$(git -C ComfyUI-Spectrum-MiniMax-H3 rev-parse --short HEAD 2>/dev/null || echo '?')）"
-else
-  log "clone Spectrum…"
-  git clone --depth 1 https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3.git >>"$SAGE_LOG" 2>&1 || true
-  if [ -d ComfyUI-Spectrum-MiniMax-H3 ]; then
-    # clone 不钉 commit = 供应链漂移；这个 sha 是出问题时唯一的复现锚点，无条件记进日志
-    log "✓ Spectrum $(git -C ComfyUI-Spectrum-MiniMax-H3 rev-parse --short HEAD 2>/dev/null || echo '?')"
-  else
-    log "[WARN] Spectrum clone 失败（不致命，只是没有跳步加速）"
-  fi
 fi
 if [ -n "${NO_SAGE:-}" ]; then
   log "NO_SAGE=1 → 跳过 SageAttention（回落 SDPA，约慢 1.5-2×）"
@@ -285,7 +268,7 @@ log "现在是: $after"
 step "步骤 6 · 重启 ComfyUI 并等 18188"
 supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
 for i in $(seq 1 60); do
-  if curl -sf -o /dev/null --max-time 3 "$API_BASE/system_stats" 2>/dev/null; then
+  if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:18188/system_stats 2>/dev/null; then
     log "✓ ComfyUI 已起（18188 就绪，用了 ${i}0s 以内）"; break
   fi
   [ "$i" = 60 ] && { log "[ERROR] 18188 十分钟没起来 —— 看 $LOG"; FAILED=$((FAILED+1)); }
@@ -300,28 +283,6 @@ for f in "${H3_FILES[@]}"; do
   if [ "$got" = "$exp" ]; then log "  OK   $f ($got B)"
   else log "  BAD  $f ($got/$exp)"; FAILED=$((FAILED+1)); fi
 done
-# 加速件是软失败项：没装上不判整机不合格，但必须看得见（否则"怎么没变快"无从查起）
-# ⚠️ /object_info/<名> 对不存在的节点也返回 200 → 只能查 JSON body 里有没有那个 key
-if curl -sf --max-time 15 "$API_BASE/object_info/SpectrumApplyMiniMaxH3" 2>/dev/null \
-     | grep -q SpectrumApplyMiniMaxH3; then
-  log "  OK   Spectrum 节点已注册（用不用由工作流决定）"
-else
-  log "  --   Spectrum 节点未注册（NO_SPECTRUM=1 或 clone 失败；不影响出片）"
-fi
-"$PY" -c "import sageattention" 2>/dev/null \
-  && log "  OK   sageattention import 正常" \
-  || log "  --   sageattention 不可用 → 回落 SDPA（约慢 1.5-2×）"
-# bf16 的命门：这个 flag 在 = 长片必 OOM。步骤 5 改的是 $ENV_FILE，这里查**真实生效**的命令行。
-# ⚠️ 必须把"读不到命令行"和"读到了且干净"分开报：合在一起写会让 supervisorctl 失败时
-#    grep 无匹配 → 走 else → 打出 "OK DynamicVRAM 开着"，这是**假通过**。
-_pid="$(supervisorctl pid comfyui 2>/dev/null | tr -dc '0-9')"
-if [ -z "$_pid" ] || [ ! -r "$PROC_DIR/$_pid/cmdline" ]; then
-  log "  ??   读不到 comfyui 命令行（pid='${_pid:-空}'）—— DynamicVRAM 状态未知，别当通过"
-elif tr '\0' ' ' < "$PROC_DIR/$_pid/cmdline" | grep -q -- '--disable-dynamic-vram'; then
-  log "  BAD  --disable-dynamic-vram 仍在生效命令行里 —— bf16 长片会 OOM"; FAILED=$((FAILED+1))
-else
-  log "  OK   DynamicVRAM 开着（已核实生效命令行，无 --disable-dynamic-vram）"
-fi
 echo
 if [ "$FAILED" -eq 0 ]; then
   log "═══ ✓ 装机完成，模型齐全、服务已起 ═══"
