@@ -81,16 +81,35 @@ fi
 HF_BIN="$(command -v hf || echo /venv/main/bin/hf)"
 HF_DIR="$(dirname "$HF_BIN")"
 
-# 下载提速：装 hf_transfer/hf_xet 加速器并开启。
-# - 高带宽机(多 Gbps)默认单流吃不满链路，hf_transfer 多流并行可快数倍；带宽已饱和的机无副作用。
-# - HF_XET_HIGH_PERFORMANCE 对 Xet 后端仓库(H3 即是)加速，缺包时被忽略、无害。
-# - HF_HUB_ENABLE_HF_TRANSFER 只在确认 hf_transfer 可 import 时才开，否则 hf 会因缺包直接报错、拖垮下载。
+# ══ 下载器选择：**由 -e H3_DOWNLOADER 传入，换档不用改本脚本、不用推 GitHub** ═══════
+#   aria2  ← 默认。多连接 -x16。①级实测 481/479 MB/s = 链路 81%，n=2 复现
+#   curl   单流直连（= aria2 原本的回落路径）。单独选它是为了做**对照臂**
+#   hf     `hf download`，Xet 关。①实测 27 MB/s（4.5% 链路）
+#          ⚠️ 这是 hf 的**最慢配置**：Xet 关 + huggingface_hub v1.x 已移除 hf_transfer
+#             = 纯单流 HTTPS × workers。别拿它当"hf 天生慢 18×"的证据
+#   hfxet  `hf download`，Xet 开。本机 2026-08-18 实测卡死 99.1%；
+#          但 2026-08-24 复核，当初据以关掉它的三条 issue 全是 state_reason=completed：
+#            · xet-core#789 HF 工程师"CDN configuration issues + quick patches"，报告者复测已好
+#            · hub#3580     HF 关闭，但 2025-12-18 有人报同样症状 → **未必彻底**
+#            · hub#4223     "fixed in hf_xet >= 1.5.1"（维护者本地复现并确认）
+#          → 本机那次失败在三条修复**之后**：要么是新问题，要么当时 hf_xet 版本过旧
+#          ⚠️ 就算完全正常也赢不了 aria2：aria2 已吃到链路 81%，天花板只剩 1.23×；
+#             Xet 唯一理论优势是 chunk 去重，而**新租机本地无 chunk 可去重** → 收益恒为 0
+#          留这个档只为一次性机器上实测，别拿它跑生产
+H3_DOWNLOADER="${H3_DOWNLOADER:-aria2}"
+case "$H3_DOWNLOADER" in aria2|curl|hf|hfxet) ;; *)
+  log "[WARN] 未知 H3_DOWNLOADER=$H3_DOWNLOADER，回落 aria2"; H3_DOWNLOADER=aria2 ;; esac
+
+# hf_transfer 在 huggingface_hub v1.0+ 已被**静默忽略**（Xet 取代），装了是空操作——
+# 保留只为老版本镜像，别把它当成"加速已开启"的证据。hf_xet 只有 hfxet 档才真的用得上。
 "$HF_DIR/pip" install -q -U hf_transfer hf_xet >/dev/null 2>&1 || pip install -q -U hf_transfer hf_xet >/dev/null 2>&1 || true
-# aria2c：给 download_one 用的多连接下载器（见那里的依据）。装不上不影响——会回落 curl。
-# `|| true` 兜底：开机时 apt 锁被占/源不通都不该拖垮 provisioning。
-command -v aria2c >/dev/null 2>&1 || \
-  (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 >/dev/null 2>&1) || true
-command -v aria2c >/dev/null 2>&1 && log "下载器: aria2c 可用（大文件走 -x16 多连接）" || log "下载器: 无 aria2c，大文件走单流 curl"
+# aria2c 只在选了 aria2 档时才装（省掉一次 apt）。`|| true`：开机 apt 锁被占不该拖垮 provisioning。
+if [ "$H3_DOWNLOADER" = "aria2" ]; then
+  command -v aria2c >/dev/null 2>&1 || \
+    (DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 >/dev/null 2>&1) || true
+fi
+_xetv="$("$HF_DIR/python" -c 'import hf_xet;print(hf_xet.__version__)' 2>/dev/null || echo none)"
+log "下载器: H3_DOWNLOADER=$H3_DOWNLOADER（aria2c=$(command -v aria2c >/dev/null 2>&1 && echo 有 || echo 无)，hf_xet=$_xetv）"
 
 # ══ 🔴 关掉 Xet，超大文件改走可续传直连（2026-08-19）══════════════════════════
 # ① 决定的依据 = **本地实测**（这一条最硬，与下面的机制假说无关）：
@@ -112,9 +131,18 @@ command -v aria2c >/dev/null 2>&1 && log "下载器: aria2c 可用（大文件�
 # ③ 关于我 8/18 的改动：曾把 HF_XET_NUM_CONCURRENT_RANGE_GETS 16→32 并加多文件并发。
 #    据 hub#3580（高性能开关都犯）看，**那大概率不是本次成因**；但当时"串行没吃满带宽"的诊断
 #    确实是错的——瓶颈不是串行，是 Xet 本身。故一并撤销，不再靠调 Xet 并发来提速。
-export HF_HUB_DISABLE_XET=1
+# 🔴 2026-08-24：这段"关 Xet"现在**只对 aria2/curl/hf 三档生效**；选 hfxet 才放它出来。
+#    上面三条 issue 已全部 completed（见 H3_DOWNLOADER 处），但本机 8/18 的失败在修复之后，
+#    所以默认仍然关——**改档只需 -e H3_DOWNLOADER=hfxet，不用动这个脚本**。
+if [ "$H3_DOWNLOADER" = "hfxet" ]; then
+  unset HF_HUB_DISABLE_XET 2>/dev/null || true
+  export HF_XET_HIGH_PERFORMANCE=1
+  log "[WARN] H3_DOWNLOADER=hfxet：Xet 已启用。本机 2026-08-18 曾卡死 99.1%，只在一次性机器上用。"
+else
+  export HF_HUB_DISABLE_XET=1
+  unset HF_XET_HIGH_PERFORMANCE HF_XET_NUM_CONCURRENT_RANGE_GETS 2>/dev/null || true
+fi
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"   # 大分片建议加长，见 hub#3580
-unset HF_XET_HIGH_PERFORMANCE HF_XET_NUM_CONCURRENT_RANGE_GETS 2>/dev/null || true
 _HUBVER="$("$HF_DIR/python" -c 'import huggingface_hub as h;print(h.__version__)' 2>/dev/null || echo '?')"
 # hf_transfer：huggingface_hub 1.0+ 已**静默忽略**它（Xet 取代）。Xet 关掉后走普通 HTTPS，
 # 老版本上 hf_transfer 仍能多流提速，故保留探测；新版上它是空操作，别当成"加速已开启"的证据。
@@ -194,7 +222,27 @@ download_one() {
     #   → **正反证据全部产生于旧传输栈，都不作数。装它是因为"失败可回落、代价接近零"，不是因为已证明更快。**
     #      真实收益必须用同机 A/B（curl 单流 vs aria2 -x16 各 60s，交替两轮）来定。
     # ⚠️ 不装/不可用一律回落到下面的 curl（原路径原样保留，续传语义一致：都靠 .partial 的现有字节数）。
-    if command -v aria2c >/dev/null 2>&1; then
+    #
+    # ── hf / hfxet 档：交给 hf CLI 单文件下载 ─────────────────────────────────────
+    # 🔴 完整性判据仍然只认**精确字节数**，不认退出码——hub#4223 的原话就是
+    #    "exits 0 while leaving .incomplete blobs"。hf 把半成品写在自己的 cache 里
+    #    （不是 $f.partial 的兄弟位置），所以 h3_file_complete 的兄弟文件检查覆盖不到它，
+    #    这里额外扫一次 cache 目录。失败一律回落 curl，续传语义不受影响。
+    if [ "$H3_DOWNLOADER" = "hf" ] || [ "$H3_DOWNLOADER" = "hfxet" ]; then
+      log "hf download $f (第 $attempt/$max 次，H3_DOWNLOADER=$H3_DOWNLOADER，Xet=$([ "$H3_DOWNLOADER" = hfxet ] && echo 开 || echo 关))..."
+      timeout 3600 "$HF_BIN" download "$HF_REPO" "$f" --local-dir "$MODELS" 2>&1 \
+        | stdbuf -oL tail -3 | stdbuf -oL tee -a "$LOG" || true
+      got="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
+      _inc="$(find "$MODELS/.cache/huggingface/download" -name '*.incomplete' 2>/dev/null | head -1)"
+      if [ "$got" = "$expected" ] && [ -z "$_inc" ]; then
+        log "✓ $f ($got B, $H3_DOWNLOADER)"
+        return 0
+      fi
+      [ -n "$_inc" ] && log "hf 退出但 cache 里仍有 .incomplete（hub#4223 症状）→ 判未完成"
+      log "hf 未完整 ($got/$expected)，丢弃、转 curl 从 0 重下…"
+      rm -f "$dest"; rm -rf "$MODELS/.cache/huggingface/download" 2>/dev/null || true
+      part_got=0
+    elif [ "$H3_DOWNLOADER" = "aria2" ] && command -v aria2c >/dev/null 2>&1; then
       log "aria2c 多连接下载 $f (第 $attempt/$max 次，-x16 续传 $part_got/$expected)..."
       # 🔴 `--summary-interval=20` 必须开（2026-08-20 踩，实例 48277770/48277679）：
       #    aria2 **预分配整个文件**（实测下载中的 .partial：apparent 51,506,295,256 =完整大小，
@@ -313,7 +361,11 @@ main() {
   # ⚠️ n=1、两段不在同一时间窗、aria2 那 107s 还在和 hf 抢带宽（单独跑只会更高）。
   # 为什么**不**并发多个文件：单文件 -x16 已吃满 81% 链路，再叠并发只是多开连接、徒增被 CDN
   #   限流的面（aria2 对 429 不重试，见 aria2#1421/#2295 至今 open）。交给下面的串行兜底循环即可。
-  if [ ${#missing[@]} -gt 0 ] && command -v aria2c >/dev/null 2>&1; then
+  # 2026-08-24：这个"跳过 hf 批次"的闸门现在也认 H3_DOWNLOADER —— 只要不是默认的 aria2 档，
+  # 就一律交给下面的串行 download_one，由它按 H3_DOWNLOADER 分流（hf/hfxet/curl 各走各的）。
+  if [ ${#missing[@]} -gt 0 ] && [ "$H3_DOWNLOADER" != "aria2" ]; then
+    log "H3_DOWNLOADER=$H3_DOWNLOADER → ${#missing[@]} 个文件全部交给串行 download_one 按该档下载"
+  elif [ ${#missing[@]} -gt 0 ] && command -v aria2c >/dev/null 2>&1; then
     log "aria2c 可用 → **${#missing[@]} 个文件全部走 aria2c -x16**（实测 481MB/s vs hf 27MB/s），跳过 hf 批次"
   elif [ ${#missing[@]} -gt 0 ]; then
     # 没有 aria2c 才退回"按大小分流"：>50GB 交给 hf 会让**整批**中断（见 HF_MAX_BYTES 处实测）
