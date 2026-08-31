@@ -90,7 +90,8 @@ download_one() {
   local f="$1"
   local dest="$MODELS/$f" part="$MODELS/$f.partial"
   local url="https://huggingface.co/${HF_REPO}/resolve/main/${f}"
-  local expected got part_got attempt=1 max=4 delay=4
+  # A2_RETRY 用 local：aria2 续传计数必须**每个文件重置**（成功时 return 0 不会走到下面那处重置）
+  local expected got part_got attempt=1 max=4 delay=4 A2_RETRY=0
   expected="$(expected_bytes "$f")" || { log "[ERROR] 未登记精确字节数: $f"; return 1; }
   if file_complete "$f"; then log "已完整，跳过: $f"; return 0; fi
   mkdir -p "$(dirname "$dest")"
@@ -128,8 +129,8 @@ download_one() {
       #    进度、续传偏移、完整性判据全部失去意义。
       timeout 3600 aria2c --continue=true --max-connection-per-server=16 --split=16 \
           --file-allocation=none \
-          --min-split-size=8M --max-tries=1 --timeout=30 --connect-timeout=30 \
-          --lowest-speed-limit=1M --allow-overwrite=false --auto-file-renaming=false \
+          --min-split-size=8M --max-tries=5 --timeout=30 --connect-timeout=30 \
+          --lowest-speed-limit=256K --allow-overwrite=false --auto-file-renaming=false \
           --summary-interval=20 --console-log-level=warn \
           --dir "$(dirname "$part")" --out "$(basename "$part")" "$url" 2>&1 \
         | stdbuf -oL tr '\r' '\n' \
@@ -148,6 +149,19 @@ download_one() {
       #    curl --continue-at - 只认文件当前大小 → 从末尾续 → 下 0 字节 →
       #    下面的大小检查通过 → 装上空壳。
       rm -f "$part.aria2" "$part"
+      # 🔴 2026-08-31 实测（bf16 66GB，实例日志）：aria2c 因 errorCode=5 "Too slow" 中止时，
+      #    字节数已经是 66280487368/66280487368 **完全相等**，却因为控制文件还在被判未完整，
+      #    然后这里把 .aria2 一起删掉、转 curl 从 0 重下 66GB。
+      #    控制文件是**唯一**记录"哪些片段真的下完了"的东西 —— 删它等于自毁续传能力。
+      #    正确做法：控制文件还在就再跑一次 aria2c（--continue=true 会照它补齐缺片），
+      #    只有连续几次都补不完，才丢弃转 curl。
+      if [ -f "${part}.aria2" ] && [ "${A2_RETRY:-0}" -lt 3 ]; then
+        A2_RETRY=$(( ${A2_RETRY:-0} + 1 ))
+        log "aria2c 中止但控制文件在 ($got/$expected) → 第 $A2_RETRY/3 次 --continue 续传，不丢分片"
+        sleep 5
+        continue
+      fi
+      A2_RETRY=0
       log "aria2c 未完整 ($got/$expected)，丢弃分片、转 curl 从 0 重下…"
     fi
     part_got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
