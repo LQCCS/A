@@ -22,6 +22,8 @@ HF_REPO="Comfy-Org/MiniMax-H3"
 # DiT 由 rent 脚本/模板的 -e H3_DIT_FILE 指定（**逗号分隔 1~2 个**，2 个用于同机对照实验）；
 # 不设=默认 int8_convrot（保手动起机不受影响）。⚠️ rent 脚本租后还会 SSH 强制校正一次，这里只是快路径。
 # 可选: ref2va_int8_convrot(34G) / bf16(66G) / pruned_bf16(40G) / pruned_int8_convrot(21G) / pruned_fp8_scaled(21G)
+#       zs05_pruned_bf16(40G) / zs05_pruned_int8_convrot(21G)      <- joeygambino/MiniMax-H3-x-Z-Image-native
+#       FeiHou_MiniMax-H3_Remix_v0.6(66G) / _int8_convrot_v2(34G)  <- FX-FeiHou/MiniMax-H3-Remix
 IFS=',' read -ra _DITS <<< "${H3_DIT_FILE:-diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors}"
 H3_FILES=(
   "${_DITS[@]}"                                                    # 选中的 DiT（1~2 个，逗号分隔）
@@ -38,10 +40,38 @@ h3_expected_bytes() {
     diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors)         echo 40225724176 ;;
     diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) echo 20970379616 ;;
     diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors)   echo 20958205608 ;;
+    # ── 非 Comfy-Org 仓库的 DiT（见 h3_repo_for / h3_remote_path_for）──
+    # 字节数取自各自仓库的 HF API + Range 请求实测（2026-09-03），逐位核对过。
+    # zs05_bf16 与官方 pruned_bf16 **字节数完全相同**，只能靠文件名区分，别合并这两行。
+    diffusion_models/minimax_h3_ref2va_pruned_zs05_bf16.safetensors)           echo 40225724176 ;;
+    diffusion_models/minimax_h3_ref2va_pruned_zs05_int8_convrot.safetensors)   echo 20970379680 ;;
+    diffusion_models/FeiHou_MiniMax-H3_Remix_v0.6.safetensors)                 echo 66246042528 ;;
+    diffusion_models/FeiHou_MiniMax-H3_Remix_v0.6_int8_convrot_v2.safetensors) echo 34004449966 ;;
     text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors)              echo 51506295256 ;;
     vae/minimax_h3_video_vae_fp16.safetensors)                           echo 5207808496 ;;
     vae/minimax_h3_audio_vae_fp32.safetensors)                           echo 605254808 ;;
     *) return 1 ;;
+  esac
+}
+
+# 🔴 2026-09-03：DiT 不再全在 Comfy-Org。本地一律落在 diffusion_models/ 下，
+#    但 zs05 和 Remix 在各自仓库的**根目录**，所以仓库和仓库内路径要分开查。
+#    不加这两个函数的话 url 会被拼成 Comfy-Org/.../diffusion_models/<外部文件名> -> 404，
+#    provisioning 判失败、rent 脚本 raise RuntimeError 中止，
+#    连后面那步知道正确仓库的 ensure_dits 都轮不到跑。
+h3_repo_for() {
+  case "$1" in
+    diffusion_models/minimax_h3_ref2va_pruned_zs05_*.safetensors) echo "joeygambino/MiniMax-H3-x-Z-Image-native" ;;
+    diffusion_models/FeiHou_MiniMax-H3_Remix_*.safetensors)       echo "FX-FeiHou/MiniMax-H3-Remix" ;;
+    *) echo "$HF_REPO" ;;
+  esac
+}
+
+h3_remote_path_for() {
+  case "$1" in
+    diffusion_models/minimax_h3_ref2va_pruned_zs05_*.safetensors) echo "${1##*/}" ;;
+    diffusion_models/FeiHou_MiniMax-H3_Remix_*.safetensors)       echo "${1##*/}" ;;
+    *) echo "$1" ;;
   esac
 }
 
@@ -165,7 +195,11 @@ download_one() {
   local expected got part_got
   # A2_RETRY 用 local：aria2 续传计数必须**每个文件重置**（成功时 return 0 不会走到下面那处重置）
   local attempt=1 max=4 delay=4 A2_RETRY=0
-  local url="https://huggingface.co/${HF_REPO}/resolve/main/${f}"
+  local repo rpath
+  repo="$(h3_repo_for "$f")"
+  rpath="$(h3_remote_path_for "$f")"
+  local url="https://huggingface.co/${repo}/resolve/main/${rpath}"
+  [ "$repo" = "$HF_REPO" ] || log "外部仓库: $f <- $repo/$rpath"
 
   expected="$(h3_expected_bytes "$f")" || {
     log "[ERROR] 未登记精确字节数: $f"; return 1;
@@ -229,9 +263,13 @@ download_one() {
     #    "exits 0 while leaving .incomplete blobs"。hf 把半成品写在自己的 cache 里
     #    （不是 $f.partial 的兄弟位置），所以 h3_file_complete 的兄弟文件检查覆盖不到它，
     #    这里额外扫一次 cache 目录。失败一律回落 curl，续传语义不受影响。
-    if [ "$H3_DOWNLOADER" = "hf" ] || [ "$H3_DOWNLOADER" = "hfxet" ]; then
+    # 🔴 仓库内路径与本地路径不一致时**不能走 hf CLI**：`hf download REPO <根目录文件>
+    #    --local-dir $MODELS` 会落到 $MODELS/<文件名>，而不是 $MODELS/diffusion_models/<文件名>，
+    #    后面 h3_file_complete 按本地路径查会判"没下成"。这种文件直接走下面的 aria2/curl —
+    #    它们用 --out / --output 显式指定落位，不受仓库结构影响。
+    if { [ "$H3_DOWNLOADER" = "hf" ] || [ "$H3_DOWNLOADER" = "hfxet" ]; } && [ "$rpath" = "$f" ]; then
       log "hf download $f (第 $attempt/$max 次，H3_DOWNLOADER=$H3_DOWNLOADER，Xet=$([ "$H3_DOWNLOADER" = hfxet ] && echo 开 || echo 关))..."
-      timeout 3600 "$HF_BIN" download "$HF_REPO" "$f" --local-dir "$MODELS" 2>&1 \
+      timeout 3600 "$HF_BIN" download "$repo" "$rpath" --local-dir "$MODELS" 2>&1 \
         | stdbuf -oL tail -3 | stdbuf -oL tee -a "$LOG" || true
       got="$(stat -c %s "$dest" 2>/dev/null || echo 0)"
       _inc="$(find "$MODELS/.cache/huggingface/download" -name '*.incomplete' 2>/dev/null | head -1)"
