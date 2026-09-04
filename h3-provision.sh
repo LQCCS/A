@@ -395,6 +395,12 @@ prefetch_nodes() {
     "https://github.com/Saganaki22/ComfyUI-sol-attn|ComfyUI-sol-attn||0"
     "https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc|ComfyUI-MiniMax-H3-PDD-Acc||0"
     "https://github.com/DonutsDelivery/ComfyUI-DonutNodes|ComfyUI-DonutNodes|feat/linux-dlss5-experimental|1"
+    # ↓ Remix 机专用（rent_5090_remix.py 的 REMIX_PACKS）。两种机器共用本开机脚本，
+    #   多取这 3 个各几 MB 的包对 H3 机没有代价；用不到的包不接线就不生效。
+    #   want_req=1 是照 remix 的 ensure_node_pack 口径 —— 它会装 requirements.txt。
+    "https://github.com/FX-FeiHou/ComfyUI-FeiHou-Easy-H3|ComfyUI-FeiHou-Easy-H3||1"
+    "https://github.com/FX-FeiHou/ComfyUI-FeiHou-Toolbox|ComfyUI-FeiHou-Toolbox||1"
+    "https://github.com/rgthree/rgthree-comfy|rgthree-comfy||1"
   )
 
   local n_have=0 n_get=0 n_fail=0
