@@ -357,6 +357,81 @@ download_one() {
   log "[ERROR] 放弃: $f（$max 次都未达到精确字节数）"; return 1
 }
 
+
+# ══ 节点包预取：与模型下载并行 ═══════════════════════════════════════════
+# 🔴 为什么加这个（2026-09-04）：
+#    原来租机脚本是**等模型下完**再通过 SSH 一个个推安装脚本装节点包，
+#    单次 SSH 往返约 3.7s（见 rent_5090_prod.py 的 _ssh_put_run 注释），8 个包全串在
+#    下载之后。而这些包全是几 MB 的 git clone，和上百 GB 的模型下载根本不抢资源 ——
+#    在这里后台起一份，整个串行段几乎消失。
+#
+# ⚠️ 三条纪律，别改：
+#   1. **必须在 ComfyUI 自己的 `pip install -r requirements.txt` 之后启动。**
+#      同一个 venv 并发 pip 会损坏 site-packages —— 这不是理论风险，rent 脚本里
+#      早就写着"同 venv 并发 pip 会损坏"。所以本函数的启动点在那一行下面，不能上移。
+#   2. **这里只负责「拿到」，不负责「判对」。** 租机脚本里的 ensure_* 一个都不删：
+#      它们仍逐个校验字节/目录、缺了补、还负责钉版本。本函数失败一律 `|| true`，
+#      最坏就是退回原来的串行装法，绝不让 provisioning 失败。
+#   3. **DLSS5 那套（Proton/vkd3d/dxvk-nvapi/Merserk 运行时）不在这里。**
+#      那是 --dlss5 才装的可选项，动辄 1 GB，不该占开机路径。
+#
+# 结果写 $PREFETCH_MANIFEST，租机脚本可以据此知道预取干了什么（现在只作日志用）。
+PREFETCH_MANIFEST="${WORKSPACE_DIR}/.h3_node_prefetch"
+PREFETCH_LOG="${WORKSPACE_DIR}/.h3_node_prefetch.log"
+
+prefetch_nodes() {
+  local cn="$CU/custom_nodes"
+  mkdir -p "$cn" || return 0
+  : > "$PREFETCH_MANIFEST"; : > "$PREFETCH_LOG"
+  cd "$cn" || return 0
+
+  # 仓库|目录名|分支(空=默认)|要不要装 requirements
+  local specs=(
+    "https://github.com/kijai/ComfyUI-KJNodes|ComfyUI-KJNodes||1"
+    "https://github.com/SeanScripts/ComfyUI-Unload-Model|ComfyUI-Unload-Model||0"
+    "https://github.com/starsFriday/ComfyUI-MiniMax-H3-LegacySampling|ComfyUI-MiniMax-H3-LegacySampling||0"
+    "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3|ComfyUI-Spectrum-MiniMax-H3||0"
+    "https://github.com/kijai/ComfyUI-SolAttn_triton|ComfyUI-SolAttn_triton||0"
+    "https://github.com/Saganaki22/ComfyUI-sol-attn|ComfyUI-sol-attn||0"
+    "https://github.com/Jalen-Brunson/ComfyUI-MiniMax-H3-PDD-Acc|ComfyUI-MiniMax-H3-PDD-Acc||0"
+    "https://github.com/DonutsDelivery/ComfyUI-DonutNodes|ComfyUI-DonutNodes|feat/linux-dlss5-experimental|1"
+  )
+
+  local n_have=0 n_get=0 n_fail=0
+  for spec in "${specs[@]}"; do
+    IFS='|' read -r url dir branch want_req <<<"$spec"
+    if [ -d "$dir/.git" ]; then
+      echo "HAVE $dir" >> "$PREFETCH_MANIFEST"; n_have=$((n_have+1)); continue
+    fi
+    rm -rf "$dir"
+    if [ -n "$branch" ]; then
+      timeout 240 git clone --depth 1 -b "$branch" "$url" "$dir" >>"$PREFETCH_LOG" 2>&1
+    else
+      timeout 240 git clone --depth 1 "$url" "$dir" >>"$PREFETCH_LOG" 2>&1
+    fi
+    if [ -d "$dir/.git" ]; then
+      echo "GET  $dir" >> "$PREFETCH_MANIFEST"; n_get=$((n_get+1))
+    else
+      # GitHub 对机房 IP 瞬时限流是已知现象（rent 脚本 preflight_net 的注释里有实例）。
+      # 这里不重试、不阻塞——留给 ensure_* 去补，它有重试和 codeload 兜底。
+      echo "FAIL $dir" >> "$PREFETCH_MANIFEST"; n_fail=$((n_fail+1)); continue
+    fi
+    # requirements 只给明确需要的两个装，且**串行**——不能并发 pip。
+    if [ "$want_req" = "1" ] && [ -s "$dir/requirements.txt" ]; then
+      local req="$dir/requirements.txt"
+      # DonutNodes 的 requirements 里有 opencv-python-headless，会盖掉环境里已有的 cv2。
+      # 已有 cv2 就把 opencv 那行剔掉再装（与 rent 脚本 ensure_donut_nodes 同一口径）。
+      if /venv/main/bin/python -c "import cv2" >/dev/null 2>&1; then
+        grep -viE '^opencv' "$dir/requirements.txt" > /tmp/_pf_req.txt 2>/dev/null && req=/tmp/_pf_req.txt
+      fi
+      timeout 600 /venv/main/bin/pip install -q -r "$req" >>"$PREFETCH_LOG" 2>&1 || \
+        echo "REQFAIL $dir" >> "$PREFETCH_MANIFEST"
+      rm -f /tmp/_pf_req.txt
+    fi
+  done
+  log "节点包预取完成：已有 $n_have / 新取 $n_get / 失败 $n_fail（失败的交给租机脚本 ensure_* 补）"
+}
+
 main() {
   log "===== H3 provisioning 开始 ====="
   [ -f /venv/main/bin/activate ] && . /venv/main/bin/activate
@@ -378,6 +453,12 @@ main() {
   git fetch --tags --force 2>&1 | tail -1 | tee -a "$LOG" || true
   git checkout v0.30.0 2>&1 | tail -1 | tee -a "$LOG" || true
   /venv/main/bin/pip install -q -r requirements.txt 2>&1 | tail -2 | tee -a "$LOG" || true
+
+  # 🔴 预取必须起在这一行**之后**：上面那句是 ComfyUI 自己的 pip，同 venv 并发 pip 会损坏。
+  #    起在这里之后 = 与模型下载并行（下载才是长杆），与任何 pip 都不重叠。
+  prefetch_nodes &
+  PREFETCH_PID=$!
+  log "节点包预取已在后台启动（pid $PREFETCH_PID），与模型下载并行"
   if [ -f "$CU/comfy_extras/nodes_minimax_h3.py" ]; then
     log "✓ H3 节点存在（ComfyUI $(git describe --tags 2>/dev/null || echo '?')）"
   else
@@ -446,6 +527,12 @@ main() {
   flock -u 9 || true
 
   # 3) 重启 comfyui 刷新 UNETLoader/CLIPLoader 列表（新下的模型才认得出）
+  #    先收掉后台预取——自定义节点包只在 ComfyUI 启动时扫描，这一次重启要能把它们一起加载，
+  #    否则租机脚本还得再重启一次。等它是安全的：prefetch_nodes 内部每步都有 timeout。
+  if [ -n "${PREFETCH_PID:-}" ]; then
+    wait "$PREFETCH_PID" 2>/dev/null || true
+    [ -s "$PREFETCH_MANIFEST" ] && log "预取清单: $(tr '\n' ' ' < "$PREFETCH_MANIFEST")"
+  fi
   supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
 
   # 4) 校验
