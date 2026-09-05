@@ -46,6 +46,13 @@ COMFY_VERSION="${COMFY_VERSION:-v0.34.2}"
 
 HF_MAIN="https://huggingface.co"
 
+# 🔴 2026-09-04 踩（实例 49913445）：HentaiP/model-vault **改过目录结构** ——
+#    `05_MiniMax_H3_Ecosystem/NSFW_LoRAs/` 整个被重命名为 `10_MiniMax_H3/LoRAs/`。
+#    旧路径返回 404（X-Error-Code: EntryNotFound），而 spread 那个 LoRA 只登记了这一个镜像，
+#    于是 4 轮重试全废、整个 provisioning 判失败——**99.7GB 都下好了，栽在最后 155MB**。
+#    教训：单镜像的条目是单点故障；HF 仓库改目录不会有任何通知，只能靠字节数校验发现。
+HP_VAULT="${HF_MAIN}/HentaiP/model-vault/resolve/main/10_MiniMax_H3/LoRAs"
+
 SPECS=(
   # ── DiT ×2（ALWAYS_DITS）────────────────────────────────────────────────
   # Eros Max beta4 int8：作者 euler/simple 6-8 步，turbo 已烘焙进权重
@@ -65,11 +72,12 @@ SPECS=(
   # VBVR H3 V1（CivitAI 2497207@3220766）SHA256 372597997f64…
   "loras/VBVR_H3_attn_only.safetensors|32826752|${HF_MAIN}/Patarapoom/h3-vbvr/resolve/main/loras/VBVR_H3_attn_only.safetensors ${HF_MAIN}/kirk86413/vbrv1-h3/resolve/main/VBVR_H3_attn_only.safetensors ${HF_MAIN}/ACCC1380/reasoning_lora_vbvr/resolve/main/VBVR_H3_attn_only.safetensors ${HF_MAIN}/gengenpa08/greun/resolve/main/Minimax/VBVR_H3_attn_only.safetensors"
   # Breast Play & Jiggle v2.0（CivitAI 2856004@3278283）SHA256 18832302cd50…
-  "loras/breastplayjiggle_h3_v2.safetensors|298262376|${HF_MAIN}/gengenpa08/greun/resolve/main/Minimax/breastplayjiggle_h3_v2.safetensors ${HF_MAIN}/cdkkkk/setup/resolve/main/h3/breastplayjiggle_h3_v2.safetensors ${HF_MAIN}/HentaiP/model-vault/resolve/main/05_MiniMax_H3_Ecosystem/NSFW_LoRAs/breastplayjiggle_h3_v2.safetensors"
+  "loras/breastplayjiggle_h3_v2.safetensors|298262376|${HF_MAIN}/gengenpa08/greun/resolve/main/Minimax/breastplayjiggle_h3_v2.safetensors ${HF_MAIN}/cdkkkk/setup/resolve/main/h3/breastplayjiggle_h3_v2.safetensors ${HP_VAULT}/breastplayjiggle_h3_v2.safetensors"
   # HMPussy V1 stills（CivitAI 2846342@3252213）作者口径强度 0.5–0.6
-  "loras/Vagina_minimax-h3_epoch20.safetensors|77580008|${HF_MAIN}/cdkkkk/setup/resolve/main/h3/Vagina_minimax-h3_epoch20.safetensors ${HF_MAIN}/HentaiP/model-vault/resolve/main/05_MiniMax_H3_Ecosystem/NSFW_LoRAs/HMPussy-V1_epoch20.safetensors"
+  "loras/Vagina_minimax-h3_epoch20.safetensors|77580008|${HF_MAIN}/cdkkkk/setup/resolve/main/h3/Vagina_minimax-h3_epoch20.safetensors ${HP_VAULT}/HMPussy-V1_epoch20.safetensors"
   # Pussy spread v0.1（CivitAI 2885332@3261512）落盘名与镜像名不同、哈希相同
-  "loras/minimax_h3_pussy_spread_v0.1.safetensors|155110288|${HF_MAIN}/HentaiP/model-vault/resolve/main/05_MiniMax_H3_Ecosystem/NSFW_LoRAs/H3_PussySpread-v01-i2v.safetensors"
+  # ⚠️ 工作流里这个 LoRA 是 **bypass**（ErosMax_beta4.json node 153 mode=4），下不来不影响出片。
+  "loras/minimax_h3_pussy_spread_v0.1.safetensors|155110288|${HP_VAULT}/H3_PussySpread-v01-i2v.safetensors"
 )
 
 # H3_DIT_FILE 若指定（rent 脚本会传），把它**追加**成额外的 DiT。
@@ -244,8 +252,12 @@ download_one() {
       log "curl 直连 $f (第 $attempt/$max 次，续传 $part_got/$expected) <- ${url##*/}"
       # 重试放在 curl 外面：每次尝试前重读 .partial 当前大小。curl 自己的 --retry
       # 会在瞬时断连后复用**过期的 -C 偏移**，把重叠的尾巴又追加一遍。
+      # --speed-limit 262144：与 aria2 的 --lowest-speed-limit=256K 对齐。
+      # 原来是 1048576（1MB/s），**比 aria2 还严** —— 慢但活着的镜像会被 curl 这条回落路径
+      # 直接掐掉，等于没有回落。2026-09-04 实测 HF CDN 会掉到 260931 B/s（aria2 报
+      # errorCode=5 Too slow），那种速度下 1MB/s 的门槛必然中止。
       if timeout 1800 curl --fail --location --continue-at - \
-          --connect-timeout 30 --speed-time 120 --speed-limit 1048576 \
+          --connect-timeout 30 --speed-time 120 --speed-limit 262144 \
           --progress-bar --output "$part" "$url" 2>&1 | tail -3 | tee -a "$LOG"; then
         got="$(stat -c %s "$part" 2>/dev/null || echo 0)"
         if [ "$got" = "$expected" ]; then
@@ -258,8 +270,10 @@ download_one() {
       log "✗ 镜像未成 ($got/$expected): ${url}"
       rm -f "$part" "${part}.aria2"
     done
-    log "✗ $f 所有镜像都未成，${delay}s 后重试第 $((attempt+1))/$max 轮…"
-    sleep $delay; delay=$((delay * 2)); attempt=$((attempt + 1))
+    attempt=$((attempt + 1))
+    [ "$attempt" -gt "$max" ] && break          # 别打印"第 5/4 轮"这种越界文案
+    log "✗ $f 所有镜像都未成，${delay}s 后重试第 $attempt/$max 轮…"
+    sleep $delay; delay=$((delay * 2))
   done
   log "[ERROR] 放弃: $f（$max 轮 × $(echo "$urls" | wc -w) 个镜像都未达到精确字节数）"
   return 1
@@ -328,10 +342,15 @@ main() {
     else log "[ERROR] 缺失/不完整 $f ($got/$bytes)"; ok=0; fi
   done
 
-  if [ "$failed" -gt 0 ] || [ "$ok" -ne 1 ]; then
-    log "[ERROR] 有模型没下成，provisioning 视为失败"
+  # 🔴 判据只用**末尾这次逐文件校验**（$ok），**不看** $failed 计数器。
+  #    原来是 `[ $failed -gt 0 ] || [ $ok -ne 1 ]`，但 $failed 一旦被置位就再也降不回来 ——
+  #    哪怕文件后来被补齐（手工补、或并发的 ensure_dits 补上），整个 provisioning 仍判失败。
+  #    权威事实是"文件此刻在不在、字节数对不对"，不是"中途失败过几次"。
+  if [ "$ok" -ne 1 ]; then
+    log "[ERROR] 有模型没下成，provisioning 视为失败（下载过程中失败 $failed 次）"
     return 1
   fi
+  [ "$failed" -gt 0 ] && log "注：下载过程中失败 $failed 次，但末尾校验全部通过，判成功"
   log "===== ✓ Eros Max provisioning 完成，模型齐全 ====="
 }
 
