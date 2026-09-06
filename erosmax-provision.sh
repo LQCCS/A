@@ -4,16 +4,16 @@
 # 与 h3-provision.sh 的关系：下载骨架（精确字节判据 / aria2→curl 回落 / flock）照搬，
 # **模型清单换成 rent_5090_remix.py 那一套**，并新增 LoRA 支持。别把两个脚本混用：
 #   h3-provision.sh   下 Comfy-Org 官方 ref2va 三件套，无 LoRA
-#   本脚本            下 Eros Max beta4 + 官方 pruned_int8 两份 DiT + TE/VAE + 4 个 LoRA
+#   本脚本            下 Eros Max beta4（社区成人 UNET）+ 官方 TE/VAE + 4 个 NSFW LoRA
+#                     **不**下官方 pruned_int8 DiT
 #
 # 装什么与 rent_5090_remix.py 的 ALWAYS_DITS / SHARED_FILES / LORA_SPECS **逐项对应**：
-#   diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors  19.5G  ← 工作流默认 UNET
-#   diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors          19.5G  ← 下拉框切换用
-#   text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors                       48.0G
+#   diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors  19.5G  ← 唯一 UNET
+#   text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors                       48.0G  ← H3 没有社区 TE
 #   vae/minimax_h3_video_vae_fp16.safetensors                                    4.8G
 #   vae/minimax_h3_audio_vae_fp32.safetensors                                    0.6G
 #   loras/ 四个                                                                  0.5G
-#   合计 ≈ 99.8 GB（十进制）
+#   合计 ≈ 78.9 GB（十进制）
 #
 # 节点包 **0 个**：工作流只用 ComfyUI 核心节点 LoraLoaderModelOnly，
 # 所以整段 prefetch_nodes 直接删掉（h3-provision.sh 里那 11 个仓库这边一个都不需要）。
@@ -54,11 +54,10 @@ HF_MAIN="https://huggingface.co"
 HP_VAULT="${HF_MAIN}/HentaiP/model-vault/resolve/main/10_MiniMax_H3/LoRAs"
 
 SPECS=(
-  # ── DiT ×2（ALWAYS_DITS）────────────────────────────────────────────────
-  # Eros Max beta4 int8：作者 euler/simple 6-8 步，turbo 已烘焙进权重
+  # ── DiT ×1（ALWAYS_DITS）────────────────────────────────────────────────
+  # Eros Max beta4 int8：社区成人档，作者 euler/simple 6-8 步，turbo 已烘焙进权重
+  # 不装 Comfy-Org / tsolful 官方 REF2VA INT8（同 SHA，用户口径只要 NSFW UNET）
   "diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors|20967637320|${HF_MAIN}/TenStrip/10Eros-Max/resolve/main/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors"
-  # 官方 pruned_int8_convrot（= CivitAI 3193385 REF2VA INT8 Pruned，同 SHA256），用来在下拉框里切换对照
-  "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors|20970379616|${HF_MAIN}/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 
   # ── TE / VAE（SHARED_FILES）─────────────────────────────────────────────
   # 🔴 TE 51.5GB > 50GB：huggingface_hub 的普通下载路径**硬拒**这个大小，所以这里
@@ -80,17 +79,21 @@ SPECS=(
   "loras/minimax_h3_pussy_spread_v0.1.safetensors|155110288|${HP_VAULT}/H3_PussySpread-v01-i2v.safetensors"
 )
 
-# H3_DIT_FILE 若指定（rent 脚本会传），把它**追加**成额外的 DiT。
-# 仅支持 TenStrip / Comfy-Org 两个仓库的已知档；不认识的就跳过，交给租后的 ensure_dits 补。
-# 逗号分隔，与 h3-provision.sh 的约定一致。
-extra_dit_url() {
+# H3_DIT_FILE（rent 脚本会传）：**替换**唯一那个 DiT，**绝不追加**。
+#
+# 🔴 2026-09-04 踩（实例 49913445）：原来是「追加」语义 —— rent 脚本传的
+#    H3_DIT_FILE 指向 bf16 档，于是在 beta4 int8 之外**又多下了 40GB**，
+#    140GB 挤进 160G 的盘，只剩 20G，且那份 bf16 工作流根本不引用。
+#    本脚本只装**一个** UNET：工作流也只引用一个，装两个纯属烧带宽和盘。
+# 逗号分隔时只取第一个，其余忽略（保留分隔符解析只为兼容旧调用方）。
+dit_url() {
   case "$1" in
     diffusion_models/10Eros_Max_*)  echo "${HF_MAIN}/TenStrip/10Eros-Max/resolve/main/${1##*/}" ;;
     diffusion_models/minimax_h3_*)  echo "${HF_MAIN}/Comfy-Org/MiniMax-H3/resolve/main/$1" ;;
     *) return 1 ;;
   esac
 }
-extra_dit_bytes() {
+dit_bytes() {
   case "$1" in
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors) echo 20967637320 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4.safetensors)              echo 40222982192 ;;
@@ -105,23 +108,25 @@ extra_dit_bytes() {
   esac
 }
 
-if [ -n "${H3_DIT_FILE:-}" ]; then
-  IFS=',' read -ra _EXTRA <<< "$H3_DIT_FILE"
-  for _d in "${_EXTRA[@]}"; do
-    _d="$(echo "$_d" | tr -d '[:space:]')"
-    [ -z "$_d" ] && continue
-    # 已在 SPECS 里就不重复加
-    _dup=0
-    for _s in "${SPECS[@]}"; do [ "${_s%%|*}" = "$_d" ] && _dup=1 && break; done
-    [ "$_dup" = 1 ] && continue
-    if _u="$(extra_dit_url "$_d")" && _b="$(extra_dit_bytes "$_d")"; then
-      SPECS+=("$_d|$_b|$_u")
-      log "H3_DIT_FILE 追加额外 DiT: $_d ($_b B)"
-    else
-      log "[WARN] H3_DIT_FILE 里的 $_d 未登记字节数/仓库，跳过（交给租后 ensure_dits 补）"
-    fi
+_d="$(echo "${H3_DIT_FILE:-}" | cut -d, -f1 | tr -d '[:space:]')"
+if [ -n "$_d" ]; then
+  for _i in "${!SPECS[@]}"; do
+    case "${SPECS[$_i]}" in
+      diffusion_models/*)
+        if [ "${SPECS[$_i]%%|*}" = "$_d" ]; then
+          log "H3_DIT_FILE 与默认档相同，无需替换: $_d"
+        elif _u="$(dit_url "$_d")" && _b="$(dit_bytes "$_d")"; then
+          log "H3_DIT_FILE 替换 DiT: ${SPECS[$_i]%%|*} -> $_d ($_b B)"
+          SPECS[$_i]="$_d|$_b|$_u"
+        else
+          log "[WARN] H3_DIT_FILE=$_d 未登记字节数/仓库 —— **保持默认档不变**（不会两个都装）"
+        fi
+        break
+        ;;
+    esac
   done
 fi
+unset _d _i _u _b
 
 # ══ 下载器 ═════════════════════════════════════════════════════════════════
 # 只保留 aria2（默认）与 curl（回落）两档。**故意砍掉 h3-provision.sh 的 hf/hfxet 两档**：
