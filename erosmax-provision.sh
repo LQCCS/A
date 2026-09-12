@@ -1,14 +1,16 @@
 #!/bin/bash
-# Eros Max beta4 provisioning —— 用作 vast comfy 模板的 PROVISIONING_SCRIPT。
+# Eros Max beta5 provisioning —— 用作 vast comfy 模板的 PROVISIONING_SCRIPT。
+# 2026-09-11 从 beta4 换到 beta5：作者 README「beta_4 and beta_3 are corrupted
+# test versions. beta_5 is the only true functional one so far.」
 #
 # 与 h3-provision.sh 的关系：下载骨架（精确字节判据 / aria2→curl 回落 / flock）照搬，
 # **模型清单换成 rent_5090_remix.py 那一套**，并新增 LoRA 支持。别把两个脚本混用：
 #   h3-provision.sh   下 Comfy-Org 官方 ref2va 三件套，无 LoRA
-#   本脚本            下 Eros Max beta4（社区成人 UNET）+ 官方 TE/VAE + 4 个 NSFW LoRA
+#   本脚本            下 Eros Max beta5（社区成人 UNET）+ 官方 TE/VAE + 4 个 NSFW LoRA
 #                     **不**下官方 pruned_int8 DiT
 #
 # 装什么与 rent_5090_remix.py 的 ALWAYS_DITS / SHARED_FILES / LORA_SPECS **逐项对应**：
-#   diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors  19.5G  ← 唯一 UNET
+#   diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors          19.5G  ← 唯一 UNET
 #   text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors                       48.0G  ← H3 没有社区 TE
 #   vae/minimax_h3_video_vae_fp16.safetensors                                    4.8G
 #   vae/minimax_h3_audio_vae_fp32.safetensors                                    0.6G
@@ -55,9 +57,10 @@ HP_VAULT="${HF_MAIN}/HentaiP/model-vault/resolve/main/10_MiniMax_H3/LoRAs"
 
 SPECS=(
   # ── DiT ×1（ALWAYS_DITS）────────────────────────────────────────────────
-  # Eros Max beta4 int8：社区成人档，作者 euler/simple 6-8 步，turbo 已烘焙进权重
+  # Eros Max beta5 int8：社区成人档，turbo（ref+fl 融合）已烘焙进权重
+  # 作者口径 er_sde/beta57 4-6 步、res_multistep/simple 6-8、LCM/simple 6-8、euler/simple 4-8
   # 不装 Comfy-Org / tsolful 官方 REF2VA INT8（同 SHA，用户口径只要 NSFW UNET）
-  "diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors|20967637320|${HF_MAIN}/TenStrip/10Eros-Max/resolve/main/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors"
+  "diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors|20970414464|${HF_MAIN}/TenStrip/10Eros-Max/resolve/main/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors"
 
   # ── TE / VAE（SHARED_FILES）─────────────────────────────────────────────
   # 🔴 TE 51.5GB > 50GB：huggingface_hub 的普通下载路径**硬拒**这个大小，所以这里
@@ -95,6 +98,8 @@ dit_url() {
 }
 dit_bytes() {
   case "$1" in
+    diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors)         echo 20970414464 ;;
+    diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors)              echo 40222982192 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors) echo 20967637320 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4.safetensors)              echo 40222982192 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors) echo 20975924960 ;;
