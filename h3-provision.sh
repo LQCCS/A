@@ -91,6 +91,7 @@ h3_file_complete() {
   [ -f "$MODELS/$f.aria2" ] && return 1          # 直接写最终名的未完成下载
   [ -f "$MODELS/$f.partial.aria2" ] && return 1  # 走 .partial 的未完成下载
   [ -f "$MODELS/$f.partial" ] && return 1        # 还有残留分片
+  [ -f "$MODELS/$f.turbo" ] && return 1          # turbo 分块下载的工作文件还在（没下完）
   got="$(stat -c %s "$MODELS/$f" 2>/dev/null || echo 0)"
   [ "$got" = "$expected" ]
 }
@@ -112,7 +113,9 @@ HF_BIN="$(command -v hf || echo /venv/main/bin/hf)"
 HF_DIR="$(dirname "$HF_BIN")"
 
 # ══ 下载器选择：**由 -e H3_DOWNLOADER 传入，换档不用改本脚本、不用推 GitHub** ═══════
-#   aria2  ← 默认。多连接 -x16。①级实测 481/479 MB/s = 链路 81%，n=2 复现
+#   turbo  ← 默认（2026-09-15 起）。高并发短连接分块直下 HF，断点续传（见 h3_turbo 注释）。
+#          ①两台宿主实测 aria2 会慢性失速（6 MiB/s、39–84 MiB/s），turbo 拉到 100–116、101–145 MiB/s（后者到线顶）
+#   aria2  多连接 -x16。①级实测 481/479 MB/s = 链路 81%，n=2 复现；但部分宿主上跑久了会衰减（见 turbo）
 #   curl   单流直连（= aria2 原本的回落路径）。单独选它是为了做**对照臂**
 #   hf     `hf download`，Xet 关。①实测 27 MB/s（4.5% 链路）
 #          ⚠️ 这是 hf 的**最慢配置**：Xet 关 + huggingface_hub v1.x 已移除 hf_transfer
@@ -126,9 +129,9 @@ HF_DIR="$(dirname "$HF_BIN")"
 #          ⚠️ 就算完全正常也赢不了 aria2：aria2 已吃到链路 81%，天花板只剩 1.23×；
 #             Xet 唯一理论优势是 chunk 去重，而**新租机本地无 chunk 可去重** → 收益恒为 0
 #          留这个档只为一次性机器上实测，别拿它跑生产
-H3_DOWNLOADER="${H3_DOWNLOADER:-aria2}"
-case "$H3_DOWNLOADER" in aria2|curl|hf|hfxet) ;; *)
-  log "[WARN] 未知 H3_DOWNLOADER=$H3_DOWNLOADER，回落 aria2"; H3_DOWNLOADER=aria2 ;; esac
+H3_DOWNLOADER="${H3_DOWNLOADER:-turbo}"
+case "$H3_DOWNLOADER" in turbo|aria2|curl|hf|hfxet) ;; *)
+  log "[WARN] 未知 H3_DOWNLOADER=$H3_DOWNLOADER，回落 turbo"; H3_DOWNLOADER=turbo ;; esac
 
 # hf_transfer 在 huggingface_hub v1.0+ 已被**静默忽略**（Xet 取代），装了是空操作——
 # 保留只为老版本镜像，别把它当成"加速已开启"的证据。hf_xet 只有 hfxet 档才真的用得上。
@@ -357,6 +360,414 @@ download_one() {
   log "[ERROR] 放弃: $f（$max 次都未达到精确字节数）"; return 1
 }
 
+# ══ turbo 下载器（H3_DOWNLOADER=turbo，2026-09-15 起默认）═══════════════════════════
+# ① 依据（两台宿主同机实测，事后 DiT/TE 都对上 HF 官方 sha256）：
+#   · 50977105（Tulsa）：aria2 -x16 开局 110 MiB/s，10 分钟后掉到 6 MiB/s —— 长连接越跑越慢，
+#     被 --lowest-speed-limit 踢掉的连接 aria2 不补；96 并发 × 64MiB 分块、每块一条新连接 → 100–116 MiB/s。
+#   · 51087016（Virginia，登记 1.1 Gbps）：aria2 在 39–84 MiB/s 之间晃 → 128 并发 101–145 MiB/s（到线顶）。
+# 做法：所有缺的文件交错派块同时下；每块 `curl -r` 一段，字节数精确才 pwrite 回工作文件并记进 sidecar；
+#   全部块到齐才改名成正式文件名（h3_file_complete 仍只认"正式名 + 精确字节数 + 无残留"）。
+#   工作文件：aria2 留下的 .partial + .partial.aria2 直接接着用（解析位图，SEEK_DATA 核对盘上真有数据）；
+#   否则新建 <文件>.turbo。被打断（含 provisioner 杀掉重跑）下次从 sidecar 续传。
+#   没有控制文件的 .partial、正式名上的半截文件都不知道哪些字节有效 → 删掉重下（也免得新旧两份一起占盘）。
+#   600 秒没有任何进度就停下返回 1，由 main 再跑一遍续传。仓库 / 仓库内路径走 h3_repo_for / h3_remote_path_for。
+# 调参：并发默认 64 起步自适应（-e H3_TURBO_START / -e H3_TURBO_MAX 384，上限还受可用内存约束）；
+#   -e H3_TURBO_WORKERS=N 则固定 N 不自适应；-e H3_TURBO_CHUNK_MB（默认 64）。回老路径：-e H3_DOWNLOADER=aria2。
+h3_turbo() {
+  local f sz args=()
+  for f in "$@"; do
+    sz="$(h3_expected_bytes "$f")" || { log "[WARN] turbo 跳过未登记字节数的文件: $f"; continue; }
+    args+=("$f|$(h3_repo_for "$f")|$(h3_remote_path_for "$f")|$sz")
+  done
+  [ ${#args[@]} -gt 0 ] || return 0
+  "$(command -v python3 || echo /venv/main/bin/python)" - "$MODELS" "${args[@]}" <<'PY' 2>&1 | stdbuf -oL tee -a "$LOG"
+import os, sys, json, time, struct, signal, threading, subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+M = sys.argv[1]
+JOBS = [a.split("|") for a in sys.argv[2:]]           # 本地相对路径|仓库|仓库内路径|字节数
+TOKEN = os.environ.get("HF_TOKEN", "")
+CHUNK = max(1, int(os.environ.get("H3_TURBO_CHUNK_MB") or 64)) << 20
+# 并发自适应（2026-09-16）：固定并发换台机器就不对——
+#   · 51177257（韩国，登记 482 Mbps）：单连接 <1 MiB/s，要 128 路才到 53 MiB/s（链路 90%）；
+#   · huggingface_hub#4893（2026-09-13，①n=1）：25 Gbit 机器并发冲到 64 路，30 秒内从 2.3 GB/s 崩到 <1 MB/s，
+#     锁到 4 路反而稳稳跑完 90 GB —— 并发不是越多越好。
+#   做法：START 起步，每 WIN 秒看一次窗口吞吐，涨过 8% 就加一档；不涨就退回最好的那档并停止加档；
+#         之后掉到最好值的 60% 以下就砍半重新试探。给 H3_TURBO_WORKERS 则固定该值、不自适应。
+W_FIX = int(os.environ.get("H3_TURBO_WORKERS") or 0)
+W_START = max(1, int(os.environ.get("H3_TURBO_START") or 64))
+STEP, WIN = 64, 15
+STALL_S = 600
+STOP, DONE = threading.Event(), threading.Event()
+G = threading.Lock()
+STATS = {"written": 0, "err": 0, "active": 0, "last_t": time.time()}
+FIN = []
+
+
+def _mem_cap():
+    """并发上限也受内存约束：每个在下的块要在内存里留一份（curl 输出）。"""
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemAvailable:"):
+                return max(32, int(int(ln.split()[1]) * 1024 * 0.25 // CHUNK))
+    except Exception:
+        pass
+    return 128
+
+
+W_MAX = W_FIX or min(int(os.environ.get("H3_TURBO_MAX") or 384), _mem_cap())
+
+
+class Gate:
+    """可以在运行中调容量的闸门（信号量改不了容量）。"""
+
+    def __init__(self, n):
+        self.cv = threading.Condition()
+        self.limit, self.busy = n, 0
+
+    def set(self, n):
+        with self.cv:
+            if n != self.limit:
+                self.limit = n
+                self.cv.notify_all()
+
+    def acquire(self):
+        with self.cv:
+            while self.busy >= self.limit and not STOP.is_set():
+                self.cv.wait(0.5)
+            self.busy += 1
+
+    def release(self):
+        with self.cv:
+            self.busy -= 1
+            self.cv.notify()
+
+
+GATE = Gate(W_FIX or W_START)
+
+
+def say(msg):
+    print(time.strftime("[%Y-%m-%d %H:%M:%S] turbo: ") + msg, flush=True)
+
+
+def rm(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def nic_rx():
+    """网卡累计收字节。调档必须按这个算窗口吞吐——按"窗口内下完的整块"算，
+    刚加并发时大量块还在途中没完成，读数会假低，会把正确的档位误判成更慢（2026-09-22 在 52012206 上真踩到）。"""
+    tot = 0
+    try:
+        for ln in open("/proc/net/dev"):
+            if ":" not in ln:
+                continue
+            name, rest = ln.split(":", 1)
+            if name.strip().startswith(("eth", "ens", "enp", "eno")):
+                tot += int(rest.split()[0])
+    except Exception:
+        return 0
+    return tot
+
+
+def parse_aria2(path, size):
+    # aria2 控制文件 v1（大端）：VER2 EXT4 IHLEN4 IH PLEN4 TOTAL8 UPLOAD8 BFLEN4 BITFIELD（位 MSB 先）
+    b = open(path, "rb").read()
+    if struct.unpack(">H", b[0:2])[0] != 1:
+        raise ValueError("aria2 控制文件版本不支持: " + path)
+    p = 6
+    p += 4 + struct.unpack(">I", b[p:p + 4])[0]
+    plen = struct.unpack(">I", b[p:p + 4])[0]
+    p += 4
+    total = struct.unpack(">Q", b[p:p + 8])[0]
+    p += 16
+    bfl = struct.unpack(">I", b[p:p + 4])[0]
+    p += 4
+    bf = b[p:p + bfl]
+    n = (size + plen - 1) // plen
+    if total != size or bfl != (n + 7) // 8 or len(bf) != bfl:
+        raise ValueError("aria2 控制文件与期望大小不符: " + path)
+    return plen, bytearray(1 if bf[i >> 3] & (0x80 >> (i & 7)) else 0 for i in range(n))
+
+
+def data_extents(fd, limit):
+    ext, off = [], 0
+    while off < limit:
+        try:
+            d = os.lseek(fd, off, os.SEEK_DATA)
+        except OSError:
+            break
+        if d >= limit:
+            break
+        try:
+            h = min(os.lseek(fd, d, os.SEEK_HOLE), limit)
+        except OSError:
+            h = limit
+        ext.append((d, h))
+        off = h
+    return ext
+
+
+class Plan:
+    def __init__(self, rel, repo, rpath, size):
+        self.rel, self.repo, self.rpath, self.size = rel, repo, rpath, int(size)
+        size = self.size
+        self.final = fin = os.path.join(M, rel)
+        part = fin + ".partial"
+        os.makedirs(os.path.dirname(fin), exist_ok=True)
+        if os.path.exists(fin):                     # bash 只交进来不完整的文件：正式名上的一定是半截
+            if os.path.exists(fin + ".aria2"):      # aria2 直写正式名被打断 → 降级成 .partial 接着用（同 download_one）
+                rm(part)
+                rm(part + ".aria2")
+                os.replace(fin, part)
+                os.replace(fin + ".aria2", part + ".aria2")
+            else:
+                rm(fin)
+        if os.path.exists(part) and os.path.exists(part + ".aria2"):
+            self.work, src = part, "接管 aria2 分片"
+        else:
+            rm(part)
+            self.work, src = fin + ".turbo", "新下"
+        self.side = self.work + ".json"
+        self.fd = os.open(self.work, os.O_RDWR | os.O_CREAT, 0o644)
+        cur = os.fstat(self.fd).st_size
+        if cur > size:
+            os.ftruncate(self.fd, 0)
+            rm(self.side)
+            cur = 0
+        if cur < size:
+            os.ftruncate(self.fd, size)
+        if os.path.exists(self.side):
+            st = json.load(open(self.side))
+            self.plen, self.done = st["plen"], bytearray(bytes.fromhex(st["done"]))
+            src = "续传"
+        elif self.work == part:
+            self.plen, self.done = parse_aria2(part + ".aria2", size)
+        else:
+            self.plen = 1 << 20
+            self.done = bytearray((size + self.plen - 1) // self.plen)
+        # 记成已完成的分片，盘上必须真有数据（不是空洞），否则改判未完成
+        ext, j = data_extents(self.fd, size), 0
+        for i in range(len(self.done)):
+            if not self.done[i]:
+                continue
+            s, e = i * self.plen, min((i + 1) * self.plen, size)
+            while j < len(ext) and ext[j][1] <= s:
+                j += 1
+            if not (j < len(ext) and ext[j][0] <= s and ext[j][1] >= e):
+                self.done[i] = 0
+        per = max(1, CHUNK // self.plen)
+        self.chunks, i, n = [], 0, len(self.done)
+        while i < n:
+            if self.done[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and not self.done[j] and j - i < per:
+                j += 1
+            self.chunks.append((i, j))
+            i = j
+        self.left = len(self.chunks)
+        self.missing = sum(min(b * self.plen, size) - a * self.plen for a, b in self.chunks)
+        self.state = "downloading" if self.left else "complete"
+        self.url_v, self.url_t, self.url_lock = None, 0.0, threading.Lock()
+        self.dirty = False
+        say("%s %s：还要下 %.2f GiB（%d 块）%s" % (rel, src, self.missing / 2**30, self.left,
+                                             "" if rpath == rel else "（来自 %s/%s）" % (repo, rpath)))
+
+    def url(self, force=False):
+        with self.url_lock:
+            if force or not self.url_v or time.time() - self.url_t > 900:
+                cmd = ["curl", "-sS", "-o", "/dev/null", "--max-time", "30", "-w", "%{redirect_url}"]
+                if TOKEN:
+                    cmd += ["-H", "Authorization: Bearer " + TOKEN]
+                cmd.append("https://huggingface.co/%s/resolve/main/%s" % (self.repo, self.rpath))
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                u = r.stdout.strip()
+                if u.startswith("https://"):
+                    self.url_v, self.url_t = u, time.time()
+                else:
+                    say("resolve 失败 %s rc=%s %s" % (self.rel, r.returncode, r.stderr.strip()[:120]))
+            return self.url_v
+
+    def save(self):
+        tmp = self.side + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"plen": self.plen, "done": bytes(self.done).hex()}, f)
+        os.replace(tmp, self.side)
+
+
+def finalize(p):
+    with G:
+        ok = all(p.done)
+        p.state = "finalizing"
+    if not ok:
+        p.state = "incomplete"
+        return
+    try:
+        os.fsync(p.fd)
+        if os.fstat(p.fd).st_size != p.size:
+            raise ValueError("工作文件大小 %d != %d" % (os.fstat(p.fd).st_size, p.size))
+        os.close(p.fd)
+        os.replace(p.work, p.final)
+        for x in (p.side, p.side + ".tmp", p.final + ".partial", p.final + ".partial.aria2",
+                  p.final + ".aria2", p.final + ".turbo"):
+            rm(x)
+        p.state = "placed"
+        say("✓ %s（%d B）" % (p.rel, p.size))
+    except Exception as ex:
+        p.state = "error"
+        say("🔴 %s 改名就位失败：%r" % (p.rel, ex))
+
+
+def work(p, a, b):
+    if STOP.is_set():
+        return
+    GATE.acquire()
+    s, e = a * p.plen, min(b * p.plen, p.size)
+    need = e - s
+    with G:
+        STATS["active"] += 1
+    try:
+        for att in range(1, 13):
+            if STOP.is_set():
+                return
+            u = p.url(force=(att > 1 and att % 2 == 0))
+            if not u:
+                time.sleep(min(2 * att, 15))
+                continue
+            r = subprocess.run(["curl", "-sS", "--fail", "--http1.1", "--connect-timeout", "10",
+                                "--max-time", "300", "--speed-limit", "262144", "--speed-time", "30",
+                                "--max-filesize", str(need + 1), "-r", "%d-%d" % (s, e - 1), u],
+                               capture_output=True)
+            if r.returncode == 0 and len(r.stdout) == need:
+                os.pwrite(p.fd, r.stdout, s)
+                with G:
+                    for i in range(a, b):
+                        p.done[i] = 1
+                    p.left -= 1
+                    p.dirty = True
+                    STATS["written"] += need
+                    STATS["last_t"] = time.time()
+                    last = p.left == 0
+                if last:
+                    t = threading.Thread(target=finalize, args=(p,))
+                    t.start()
+                    FIN.append(t)
+                return
+            with G:
+                STATS["err"] += 1
+            time.sleep(min(1.5 * att, 15))
+    finally:
+        with G:
+            STATS["active"] -= 1
+        GATE.release()
+
+
+def monitor(plans, total):
+    t_print, w_print = time.time(), 0
+    rx_print = nic_rx()
+    settle = 0
+    best_rate, best_w, ramping = 0.0, GATE.limit, W_FIX == 0
+    while not DONE.wait(5):
+        with G:
+            dirty = [p for p in plans if p.dirty and p.state == "downloading"]
+            for p in dirty:
+                p.dirty = False
+            w, active, err, last_t = STATS["written"], STATS["active"], STATS["err"], STATS["last_t"]
+        for p in dirty:
+            try:
+                p.save()
+            except Exception as ex:
+                say("sidecar 写失败 %r" % ex)
+        now = time.time()
+        if now - t_print >= WIN:
+            rx = nic_rx()
+            rate_chunk = (w - w_print) / (now - t_print)
+            rate = (rx - rx_print) / (now - t_print) if rx and rx_print and rx > rx_print else rate_chunk
+            rx_print = rx
+            eta = "%dm%02ds" % divmod(int((total - w) / rate), 60) if rate > 0 else "--"
+            print("[#turbo %.1fGiB/%.1fGiB(%d%%) CN:%d/%d 网卡:%dMiB ETA:%s 重试:%d]"
+                  % (w / 2**30, total / 2**30, 100 * w // max(total, 1), active, GATE.limit,
+                     rate / 2**20, eta, err), flush=True)
+            t_print, w_print = now, w
+            if settle > 0:                     # 刚改过档，这一窗只记不判（在途的块还没算进来）
+                settle -= 1
+                if rate > best_rate:
+                    best_rate, best_w = rate, GATE.limit
+            elif ramping and rate > 0:
+                tried = GATE.limit
+                if rate > best_rate * 1.08:
+                    best_rate, best_w = rate, tried
+                    if tried < W_MAX:
+                        GATE.set(min(W_MAX, tried + STEP))
+                        settle = 1
+                        say("并发 %d→%d（这一档 %d MiB/s，还在涨）" % (tried, GATE.limit, rate / 2**20))
+                    else:
+                        ramping = False
+                        say("并发已到上限 %d（%d MiB/s）" % (tried, rate / 2**20))
+                else:
+                    ramping = False
+                    GATE.set(best_w)
+                    say("并发定在 %d（加到 %d 只有 %d MiB/s，没超过 %d MiB/s）"
+                        % (best_w, tried, rate / 2**20, best_rate / 2**20))
+            elif not ramping and best_rate > 0 and rate > 0 and rate < best_rate * 0.6 and GATE.limit > 16:
+                say("吞吐掉到 %d MiB/s（曾 %d），并发 %d→%d 重新试探"
+                    % (rate / 2**20, best_rate / 2**20, GATE.limit, max(16, GATE.limit // 2)))
+                GATE.set(max(16, GATE.limit // 2))
+                best_rate, ramping, settle = rate, True, 1
+        if now - last_t > STALL_S and not STOP.is_set():
+            say("🔴 %d 秒没有任何进度，停下（已下的分片记在 sidecar，下一遍续传）" % STALL_S)
+            STOP.set()
+
+
+def main():
+    try:
+        plans = [Plan(*j) for j in JOBS]
+    except Exception as ex:
+        say("🔴 准备工作文件失败：%r" % ex)
+        return 2
+    total = sum(p.missing for p in plans)
+    say("%d 个文件，这次要下 %.1f GiB；块 %d MiB；并发 %s"
+        % (len(plans), total / 2**30, CHUNK >> 20,
+           ("固定 %d（H3_TURBO_WORKERS）" % W_FIX) if W_FIX else ("%d 起步、上限 %d、自适应" % (W_START, W_MAX))))
+    signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+    signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    threading.Thread(target=monitor, args=(plans, total), daemon=True).start()
+    for p in plans:
+        if p.state == "complete":
+            t = threading.Thread(target=finalize, args=(p,))
+            t.start()
+            FIN.append(t)
+    with ThreadPoolExecutor(max_workers=max(W_MAX, GATE.limit)) as ex:
+        queues = [list(p.chunks) for p in plans]      # 交错派块：几个文件同时推进，小 VAE 很快就位
+        while any(queues):
+            for p, q in zip(plans, queues):
+                if q:
+                    ex.submit(work, p, *q.pop(0))
+    for t in list(FIN):
+        t.join()
+    DONE.set()
+    for p in plans:
+        if p.state == "downloading":
+            p.state = "incomplete"
+            try:
+                p.save()
+            except Exception:
+                pass
+    bad = ["%s=%s" % (p.rel, p.state) for p in plans if p.state != "placed"]
+    say("本遍结束：" + ("全部就位" if not bad else "未完成 " + ", ".join(bad)))
+    return 0 if not bad else 1
+
+
+sys.exit(main())
+PY
+  return "${PIPESTATUS[0]}"
+}
+
 
 # ══ 节点包预取：与模型下载并行 ═══════════════════════════════════════════
 # 🔴 为什么加这个（2026-09-04）：
@@ -502,7 +913,19 @@ main() {
   #   限流的面（aria2 对 429 不重试，见 aria2#1421/#2295 至今 open）。交给下面的串行兜底循环即可。
   # 2026-08-24：这个"跳过 hf 批次"的闸门现在也认 H3_DOWNLOADER —— 只要不是默认的 aria2 档，
   # 就一律交给下面的串行 download_one，由它按 H3_DOWNLOADER 分流（hf/hfxet/curl 各走各的）。
-  if [ ${#missing[@]} -gt 0 ] && [ "$H3_DOWNLOADER" != "aria2" ]; then
+  if [ ${#missing[@]} -gt 0 ] && [ "$H3_DOWNLOADER" = "turbo" ]; then
+    # turbo：分块并发下完所有缺的文件；没下完的（块失败 / 600s 无进度）从 sidecar 续传，最多 3 遍。
+    # 不交给 aria2 兜底：它会从 0 另起一份 .partial，和 turbo 的工作文件一起占双份盘。
+    log "turbo → ${#missing[@]} 个文件分块并发下载（并发 ${H3_TURBO_WORKERS:-128} × 块 ${H3_TURBO_CHUNK_MB:-64}MiB）"
+    local pass
+    for pass in 1 2 3; do
+      missing=()
+      for f in "${H3_FILES[@]}"; do h3_file_complete "$f" || missing+=("$f"); done
+      [ ${#missing[@]} -eq 0 ] && break
+      [ "$pass" -gt 1 ] && log "turbo 第 $pass 遍：还差 ${#missing[@]} 个文件，从 sidecar 续传"
+      h3_turbo "${missing[@]}" || true
+    done
+  elif [ ${#missing[@]} -gt 0 ] && [ "$H3_DOWNLOADER" != "aria2" ]; then
     log "H3_DOWNLOADER=$H3_DOWNLOADER → ${#missing[@]} 个文件全部交给串行 download_one 按该档下载"
   elif [ ${#missing[@]} -gt 0 ] && command -v aria2c >/dev/null 2>&1; then
     log "aria2c 可用 → **${#missing[@]} 个文件全部走 aria2c -x16**（实测 481MB/s vs hf 27MB/s），跳过 hf 批次"
@@ -528,7 +951,13 @@ main() {
   for p in "${pids[@]}"; do wait "$p" || true; done   # 两路都收完再进兜底校验
   local failed=0
   for f in "${H3_FILES[@]}"; do
-    h3_file_complete "$f" || download_one "$f" || failed=$((failed+1))
+    if [ "$H3_DOWNLOADER" = "turbo" ]; then
+      h3_file_complete "$f" && continue
+      log "[ERROR] turbo 3 遍后仍不完整: $f（provisioner 重跑本脚本时从 sidecar 续传；换老路径用 -e H3_DOWNLOADER=aria2）"
+      failed=$((failed+1))
+    else
+      h3_file_complete "$f" || download_one "$f" || failed=$((failed+1))
+    fi
   done
   flock -u 9 || true
 
