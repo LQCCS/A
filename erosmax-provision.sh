@@ -1,21 +1,23 @@
 #!/bin/bash
-# Eros Max beta5 provisioning —— 用作 vast comfy 模板的 PROVISIONING_SCRIPT。
-# 2026-09-11 从 beta4 换到 beta5：作者 README「beta_4 and beta_3 are corrupted
-# test versions. beta_5 is the only true functional one so far.」
+# Eros Max beta6 provisioning —— 用作 vast comfy 模板的 PROVISIONING_SCRIPT。
+# 2026-10-18 从 beta5 换到 beta6 普通 INT8。
+# 文件是 10Eros_Max_h3_8stepTURBO_beta6_int8.safetensors，不是 UNSTABLE 那份。
+# README 顶部：shift 10/3、8-12 步、fully dense，SLA 会毁掉它。
+# 同文件靠后仍有旧句 "beta_5 is the only true functional one so far"，不拿它当当前口径。
 #
 # 与 h3-provision.sh 的关系：下载骨架（精确字节判据 / aria2→curl 回落 / flock）照搬，
 # **模型清单换成 rent_5090_remix.py 那一套**，并新增 LoRA 支持。别把两个脚本混用：
 #   h3-provision.sh   下 Comfy-Org 官方 ref2va 三件套，无 LoRA
-#   本脚本            下 Eros Max beta5（社区成人 UNET）+ 官方 TE/VAE + 4 个 NSFW LoRA
-#                     **不**下官方 pruned_int8 DiT
+#   本脚本            下 Eros Max beta6（社区成人 UNET）+ 官方 TE/VAE + 4 个 NSFW LoRA
+#                     **不**下官方 pruned_int8 DiT，也**不**下 UNSTABLE
 #
 # 装什么与 rent_5090_remix.py 的 ALWAYS_DITS / SHARED_FILES / LORA_SPECS **逐项对应**：
-#   diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors          19.5G  ← 唯一 UNET
-#   text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors                       48.0G  ← H3 没有社区 TE
-#   vae/minimax_h3_video_vae_fp16.safetensors                                    4.8G
-#   vae/minimax_h3_audio_vae_fp32.safetensors                                    0.6G
-#   loras/ 四个                                                                  0.5G
-#   合计 ≈ 78.9 GB（十进制）
+#   diffusion_models/10Eros_Max_h3_8stepTURBO_beta6_int8.safetensors            21.71 GB ← 唯一 UNET
+#   text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors                       51.5 GB  ← H3 没有社区 TE
+#   vae/minimax_h3_video_vae_fp16.safetensors                                    5.2 GB
+#   vae/minimax_h3_audio_vae_fp32.safetensors                                    0.6 GB
+#   loras/ 四个                                                                  0.6 GB
+#   合计 ≈ 79.6 GB（十进制）
 #
 # 节点包 **0 个**：工作流只用 ComfyUI 核心节点 LoraLoaderModelOnly，
 # 所以整段 prefetch_nodes 直接删掉（h3-provision.sh 里那 11 个仓库这边一个都不需要）。
@@ -43,7 +45,8 @@ COMFY_VERSION="${COMFY_VERSION:-v0.34.2}"
 # 硬套 case 就得再加第四个函数。直接把 URL 列表写进表里，DiT 和 LoRA 用同一套下载器。
 # URL 按顺序试，谁先达到精确字节数就用谁。
 #
-# 字节数来源：HF API tree + Range Content-Range，2026-09-04 复核（与 rent_5090_remix.py 同一批）。
+# 字节数来源：TE/VAE、Breast、HMPussy 是 2026-09-04 的 HF API + Range。
+# beta6 DiT、VBVR Pro、pussy spread v0.2 是 2026-10-18 的 HF API tree size。
 # 🔴 别"顺手"改这些数字：完整性判据只认精确字节，改错一位会让下好的文件被判残缺、无限重下。
 
 HF_MAIN="https://huggingface.co"
@@ -57,10 +60,11 @@ HP_VAULT="${HF_MAIN}/HentaiP/model-vault/resolve/main/10_MiniMax_H3/LoRAs"
 
 SPECS=(
   # ── DiT ×1（ALWAYS_DITS）────────────────────────────────────────────────
-  # Eros Max beta5 int8：社区成人档，turbo（ref+fl 融合）已烘焙进权重
-  # 作者口径 er_sde/beta57 4-6 步、res_multistep/simple 6-8、LCM/simple 6-8、euler/simple 4-8
-  # 不装 Comfy-Org / tsolful 官方 REF2VA INT8（同 SHA，用户口径只要 NSFW UNET）
-  "diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors|20970414464|${HF_MAIN}/TenStrip/10Eros-Max/resolve/main/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors"
+  # Eros Max beta6 普通 int8。HF API tree 2026-10-18 size=21709633539。
+  # SHA256 e2c5493e5997726ab12f17caecd6fe88c7e64b135bd3435c0f158c8f1b632a5f
+  # 不是 UNSTABLE（10Eros_Max_FastH3_VSAgates_UNSTABLE_beta6-int8_HQ，26749425456）。
+  # 工作流：euler/simple/8 + shift video 10 / audio 3。不要开 SLA。
+  "diffusion_models/10Eros_Max_h3_8stepTURBO_beta6_int8.safetensors|21709633539|${HF_MAIN}/TenStrip/10Eros-Max/resolve/main/10Eros_Max_h3_8stepTURBO_beta6_int8.safetensors"
 
   # ── TE / VAE（SHARED_FILES）─────────────────────────────────────────────
   # 🔴 TE 51.5GB > 50GB：huggingface_hub 的普通下载路径**硬拒**这个大小，所以这里
@@ -71,15 +75,18 @@ SPECS=(
 
   # ── LoRA ×4（LORA_SPECS）────────────────────────────────────────────────
   # CivitAI 要登录才能下，所以全走公开 HF 镜像；每个给多个镜像，按顺序试到字节数对上。
-  # VBVR H3 V1（CivitAI 2497207@3220766）SHA256 372597997f64…
-  "loras/VBVR_H3_attn_only.safetensors|32826752|${HF_MAIN}/Patarapoom/h3-vbvr/resolve/main/loras/VBVR_H3_attn_only.safetensors ${HF_MAIN}/kirk86413/vbrv1-h3/resolve/main/VBVR_H3_attn_only.safetensors ${HF_MAIN}/ACCC1380/reasoning_lora_vbvr/resolve/main/VBVR_H3_attn_only.safetensors ${HF_MAIN}/gengenpa08/greun/resolve/main/Minimax/VBVR_H3_attn_only.safetensors"
+  # VBVR H3 Pro（CivitAI 2497207@3306139）SHA256 9c20efa6d207…
+  # 三个镜像 2026-10-18 HF API tree 都是 65628216 字节、同一 lfs oid。
+  "loras/H3_VBVR_Pro_attn_only.safetensors|65628216|${HF_MAIN}/kirk86413/vbrv2-h3/resolve/main/H3_VBVR_Pro_attn_only.safetensors ${HF_MAIN}/Kutches/minmax/resolve/main/H3_VBVR_Pro_attn_only.safetensors ${HF_MAIN}/Cufuudsa/h3-loras/resolve/main/H3_VBVR_Pro_attn_only.safetensors"
   # Breast Play & Jiggle v2.0（CivitAI 2856004@3278283）SHA256 18832302cd50…
   "loras/breastplayjiggle_h3_v2.safetensors|298262376|${HF_MAIN}/gengenpa08/greun/resolve/main/Minimax/breastplayjiggle_h3_v2.safetensors ${HF_MAIN}/cdkkkk/setup/resolve/main/h3/breastplayjiggle_h3_v2.safetensors ${HP_VAULT}/breastplayjiggle_h3_v2.safetensors"
   # HMPussy V1 stills（CivitAI 2846342@3252213）作者口径强度 0.5–0.6
   "loras/Vagina_minimax-h3_epoch20.safetensors|77580008|${HF_MAIN}/cdkkkk/setup/resolve/main/h3/Vagina_minimax-h3_epoch20.safetensors ${HP_VAULT}/HMPussy-V1_epoch20.safetensors"
-  # Pussy spread v0.1（CivitAI 2885332@3261512）落盘名与镜像名不同、哈希相同
-  # ⚠️ 工作流里这个 LoRA 是 **bypass**（ErosMax_beta4.json node 153 mode=4），下不来不影响出片。
-  "loras/minimax_h3_pussy_spread_v0.1.safetensors|155110288|${HP_VAULT}/H3_PussySpread-v01-i2v.safetensors"
+  # Pussy spread v0.2（CivitAI 2885332@3306941）SHA256 4670e3bd2c30…
+  # HF 公开镜像只核实到一份。CivitAI API 2026-10-18 HEAD 无需登录，Content-Length 对得上，
+  # 放在后面当备用。登记的是 API 地址，不是会过期的 b2 签名直链。
+  # ⚠️ 工作流里这个 LoRA 仍是 **bypass**（ErosMax_beta6*.json node 153 mode=4），下不来不影响出片。
+  "loras/minimax_h3_pussy_spread_v0.2.safetensors|155110280|${HF_MAIN}/98sd7fc9sdf/pussyview/resolve/main/minimax_h3_pussy_spread_v0.2.safetensors https://civitai.com/api/download/models/3306941"
 )
 
 # H3_DIT_FILE（rent 脚本会传）：**替换**唯一那个 DiT，**绝不追加**。
@@ -98,6 +105,10 @@ dit_url() {
 }
 dit_bytes() {
   case "$1" in
+    diffusion_models/10Eros_Max_h3_8stepTURBO_beta6_int8.safetensors)           echo 21709633539 ;;
+    diffusion_models/10Eros_Max_h3_8stepTURBO_beta6_pruned.safetensors)         echo 40222950568 ;;
+    diffusion_models/10Eros_Max_h3_8stepTURBO_beta6_bf16.safetensors)           echo 66246043136 ;;
+    diffusion_models/10Eros_Max_FastH3_VSAgates_UNSTABLE_beta6-int8_HQ.safetensors) echo 26749425456 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5_int8.safetensors)         echo 20970414464 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors)              echo 40222982192 ;;
     diffusion_models/10Eros_Max_h3_TURBO-hybrid_beta4_int8_convrot.safetensors) echo 20967637320 ;;
