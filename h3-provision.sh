@@ -40,6 +40,7 @@ h3_expected_bytes() {
     diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors)         echo 40225724176 ;;
     diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors) echo 20970379616 ;;
     diffusion_models/minimax_h3_ref2va_pruned_fp8_scaled.safetensors)   echo 20958205608 ;;
+    diffusion_models/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors) echo 20967647456 ;;
     # ── 非 Comfy-Org 仓库的 DiT（见 h3_repo_for / h3_remote_path_for）──
     # 字节数取自各自仓库的 HF API + Range 请求实测（2026-09-03），逐位核对过。
     # zs05_bf16 与官方 pruned_bf16 **字节数完全相同**，只能靠文件名区分，别合并这两行。
@@ -61,6 +62,7 @@ h3_expected_bytes() {
 #    连后面那步知道正确仓库的 ensure_dits 都轮不到跑。
 h3_repo_for() {
   case "$1" in
+    diffusion_models/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors) echo "WarmBloodAban/Minimax-h3_Singularity" ;;
     diffusion_models/minimax_h3_ref2va_pruned_zs05_*.safetensors) echo "joeygambino/MiniMax-H3-x-Z-Image-native" ;;
     diffusion_models/FeiHou_MiniMax-H3_Remix_*.safetensors)       echo "FX-FeiHou/MiniMax-H3-Remix" ;;
     *) echo "$HF_REPO" ;;
@@ -69,9 +71,17 @@ h3_repo_for() {
 
 h3_remote_path_for() {
   case "$1" in
+    diffusion_models/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors) echo "${1##*/}" ;;
     diffusion_models/minimax_h3_ref2va_pruned_zs05_*.safetensors) echo "${1##*/}" ;;
     diffusion_models/FeiHou_MiniMax-H3_Remix_*.safetensors)       echo "${1##*/}" ;;
     *) echo "$1" ;;
+  esac
+}
+
+h3_revision_for() {
+  case "$1" in
+    diffusion_models/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors) echo "1259cf16cd0b655ba691a32fb46a409142762972" ;;
+    *) echo main ;;
   esac
 }
 
@@ -201,7 +211,8 @@ download_one() {
   local repo rpath
   repo="$(h3_repo_for "$f")"
   rpath="$(h3_remote_path_for "$f")"
-  local url="https://huggingface.co/${repo}/resolve/main/${rpath}"
+  local rev="$(h3_revision_for "$f")"
+  local url="https://huggingface.co/${repo}/resolve/${rev}/${rpath}"
   [ "$repo" = "$HF_REPO" ] || log "外部仓库: $f <- $repo/$rpath"
 
   expected="$(h3_expected_bytes "$f")" || {
@@ -377,7 +388,7 @@ h3_turbo() {
   local f sz args=()
   for f in "$@"; do
     sz="$(h3_expected_bytes "$f")" || { log "[WARN] turbo 跳过未登记字节数的文件: $f"; continue; }
-    args+=("$f|$(h3_repo_for "$f")|$(h3_remote_path_for "$f")|$sz")
+    args+=("$f|$(h3_repo_for "$f")|$(h3_remote_path_for "$f")|$sz|$(h3_revision_for "$f")")
   done
   [ ${#args[@]} -gt 0 ] || return 0
   "$(command -v python3 || echo /venv/main/bin/python)" - "$MODELS" "${args[@]}" <<'PY' 2>&1 | stdbuf -oL tee -a "$LOG"
@@ -385,7 +396,7 @@ import os, sys, json, time, struct, signal, threading, subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 M = sys.argv[1]
-JOBS = [a.split("|") for a in sys.argv[2:]]           # 本地相对路径|仓库|仓库内路径|字节数
+JOBS = [a.split("|") for a in sys.argv[2:]]           # 本地相对路径|仓库|仓库内路径|字节数|revision
 TOKEN = os.environ.get("HF_TOKEN", "")
 CHUNK = max(1, int(os.environ.get("H3_TURBO_CHUNK_MB") or 64)) << 20
 # 并发自适应（2026-09-16）：固定并发换台机器就不对——
@@ -512,8 +523,9 @@ def data_extents(fd, limit):
 
 
 class Plan:
-    def __init__(self, rel, repo, rpath, size):
+    def __init__(self, rel, repo, rpath, size, revision):
         self.rel, self.repo, self.rpath, self.size = rel, repo, rpath, int(size)
+        self.revision = revision
         size = self.size
         self.final = fin = os.path.join(M, rel)
         part = fin + ".partial"
@@ -584,7 +596,7 @@ class Plan:
                 cmd = ["curl", "-sS", "-o", "/dev/null", "--max-time", "30", "-w", "%{redirect_url}"]
                 if TOKEN:
                     cmd += ["-H", "Authorization: Bearer " + TOKEN]
-                cmd.append("https://huggingface.co/%s/resolve/main/%s" % (self.repo, self.rpath))
+                cmd.append("https://huggingface.co/%s/resolve/%s/%s" % (self.repo, self.revision, self.rpath))
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 u = r.stdout.strip()
                 if u.startswith("https://"):
