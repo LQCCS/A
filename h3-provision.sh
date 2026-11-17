@@ -81,7 +81,7 @@ h3_remote_path_for() {
 h3_revision_for() {
   case "$1" in
     diffusion_models/Minimax-h3_Singularity_ref2va_Pruned_v1.3_int8.safetensors) echo "1259cf16cd0b655ba691a32fb46a409142762972" ;;
-    *) echo main ;;
+    *) if [ "$(h3_repo_for "$1")" = "$HF_REPO" ]; then echo "${H3_HF_REV:-main}"; else echo main; fi ;;
   esac
 }
 
@@ -523,7 +523,7 @@ def data_extents(fd, limit):
 
 
 class Plan:
-    def __init__(self, rel, repo, rpath, size, revision):
+    def __init__(self, rel, repo, rpath, size, revision="main"):
         self.rel, self.repo, self.rpath, self.size = rel, repo, rpath, int(size)
         self.revision = revision
         size = self.size
@@ -806,6 +806,7 @@ prefetch_nodes() {
   local cn="$CU/custom_nodes"
   mkdir -p "$cn" || return 0
   : > "$PREFETCH_MANIFEST"; : > "$PREFETCH_LOG"
+  rm -f "$PREFETCH_MANIFEST.done"
   cd "$cn" || return 0
 
   # 仓库|目录名|分支(空=默认)|要不要装 requirements
@@ -855,10 +856,14 @@ prefetch_nodes() {
       fi
       timeout 600 /venv/main/bin/pip install -q -r "$req" >>"$PREFETCH_LOG" 2>&1 || \
         echo "REQFAIL $dir" >> "$PREFETCH_MANIFEST"
+      if ! grep -qxF "REQFAIL $dir" "$PREFETCH_MANIFEST"; then
+        touch "$dir/.h3-deps-$(git -C "$dir" rev-parse HEAD)"
+      fi
       rm -f /tmp/_pf_req.txt
     fi
   done
   log "节点包预取完成：已有 $n_have / 新取 $n_get / 失败 $n_fail（失败的交给租机脚本 ensure_* 补）"
+  touch "$PREFETCH_MANIFEST.done"
 }
 
 main() {
@@ -877,17 +882,29 @@ main() {
   #        · 0.31.1 的 SageAttention sm120 噪声修复 → 触发点 >154k token，我们 92k，不受影响
   #      代价却实在：0.31.0 起走 ModelSamplingAV 音频路径(社区报噪底高)；且现有 62 条基准实测
   #      全在 v0.30.0 上，换版本会让历史数据不可比。→ 有明确需求(如上高分辨率顶过 154k)再升。
-  log "升级 ComfyUI -> v0.30.0"
+  local target="${H3_COMFY_VERSION:-v0.30.0}"
+  # Python-managed installations share this target and defer the final service start.
+  if [ "${H3_DEFER_START:-0}" = 1 ]; then supervisorctl stop comfyui >/dev/null 2>&1 || true; fi
+  log "ComfyUI 目标版本 -> $target"
   cd "$CU" || { log "[ERROR] 进不去 $CU"; return 1; }
-  git fetch --tags --force 2>&1 | tail -1 | tee -a "$LOG" || true
-  git checkout v0.30.0 2>&1 | tail -1 | tee -a "$LOG" || true
-  /venv/main/bin/pip install -q -r requirements.txt 2>&1 | tail -2 | tee -a "$LOG" || true
+  if [ "$(git describe --tags --exact-match 2>/dev/null)" != "$target" ]; then
+    git fetch --tags --force 2>&1 | tail -1 | tee -a "$LOG" || return 1
+    git checkout "$target" 2>&1 | tail -1 | tee -a "$LOG" || return 1
+  fi
+  local core_revision
+  core_revision="$(git rev-parse HEAD)" || return 1
+  if [ ! -f "$CU/.h3-core-deps" ] || [ "$(cat "$CU/.h3-core-deps")" != "$core_revision" ] || [ requirements.txt -nt "$CU/.h3-core-deps" ]; then
+    /venv/main/bin/pip install -q -r requirements.txt 2>&1 | tail -2 | tee -a "$LOG" || return 1
+    printf '%s\n' "$core_revision" > "$CU/.h3-core-deps"
+  fi
 
   # 🔴 预取必须起在这一行**之后**：上面那句是 ComfyUI 自己的 pip，同 venv 并发 pip 会损坏。
   #    起在这里之后 = 与模型下载并行（下载才是长杆），与任何 pip 都不重叠。
-  prefetch_nodes &
-  PREFETCH_PID=$!
-  log "节点包预取已在后台启动（pid $PREFETCH_PID），与模型下载并行"
+  if [ "${H3_PREFETCH_NODES:-1}" = 1 ]; then
+    prefetch_nodes &
+    PREFETCH_PID=$!
+    log "节点包预取已在后台启动（pid $PREFETCH_PID），与模型下载并行"
+  fi
   if [ -f "$CU/comfy_extras/nodes_minimax_h3.py" ]; then
     log "✓ H3 节点存在（ComfyUI $(git describe --tags 2>/dev/null || echo '?')）"
   else
@@ -980,7 +997,9 @@ main() {
     wait "$PREFETCH_PID" 2>/dev/null || true
     [ -s "$PREFETCH_MANIFEST" ] && log "预取清单: $(tr '\n' ' ' < "$PREFETCH_MANIFEST")"
   fi
-  supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
+  if [ "${H3_DEFER_START:-0}" != 1 ]; then
+    supervisorctl restart comfyui 2>&1 | tail -1 | tee -a "$LOG" || true
+  fi
 
   # 4) 校验
   local ok=1
